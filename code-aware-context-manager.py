@@ -1,10 +1,10 @@
 """
-title: Code-Aware Context Manager with LTM & Summarization (v5.15)
-description: Full-featured context manager for coding assistants. Persists state, tracks line ranges, applies diffs, compresses LTM, scores importance, learns from assistant responses, summarizes inactive code, supports manual importance markers, robust LLM fallback, natural language forget commands, feedback tracking, hierarchical project-based memory, LRU cache, optional reranking, semantic dependency tracking, automatic handling of oversized code blocks, smart context selection, hierarchical conversation compression, automatic duplicate removal, frequency-based prioritization, and content-aware selective summarization.
+title: Code-Aware Context Manager with LTM & Summarization (v5.17)
+description: Full-featured context manager for coding assistants. Persists state, tracks line ranges, applies diffs, compresses LTM, scores importance, learns from assistant responses, summarizes inactive code, supports manual importance markers, robust LLM fallback, natural language forget/remember commands, feedback tracking, hierarchical project-based memory, LRU cache, optional reranking, semantic dependency tracking, automatic handling of oversized code blocks, smart context selection, hierarchical conversation compression, automatic duplicate removal, frequency-based prioritization, content-aware selective summarization, natural language remember (pin) commands, proactive context window management, confidence estimation, and explicit fact storage.
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.15.0
+version: 5.17.0
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz
 """
@@ -95,6 +95,7 @@ class CodeBlock(BaseModel):
     generated_by_assistant: bool = False
     dependencies: List[str] = Field(default_factory=list)
     potentially_affected: bool = False
+    pinned: bool = False
     affected_timestamp: float = 0.0
 
     def __init__(self, **data):
@@ -238,6 +239,46 @@ class Filter:
         )
         frequency_decay_hours: float = Field(
             default=12.0, description="Half-life for frequency boost."
+        )
+
+        # ---- Metacognitive features ----
+        enable_confidence_scoring: bool = Field(
+            default=True,
+            description="Ask assistant to estimate confidence (0-100%) in its responses.",
+        )
+        confidence_prompt: str = Field(
+            default="\n\nAfter your response, on a new line, output '[Confianza: XX%]' where XX is your estimated confidence (0-100) in the correctness and completeness of your answer, based on the available context. If you lack information, give lower confidence and suggest what context would help.",
+            description="Suffix to add to system prompt to request confidence.",
+        )
+        proactive_context_warning_threshold: float = Field(
+            default=0.85,
+            description="Fraction of context_window_tokens that triggers a proactive warning (0.0-1.0).",
+        )
+        proactive_context_warning_message: str = Field(
+            default="\n\n⚠️ **Context Warning**: The conversation is using more than {percent}% of the available context window ({used_tokens}/{max_tokens} tokens). Consider using `/forget` to remove irrelevant parts, `/remember` to pin important context, or ask me to summarize older parts.",
+            description="Warning message injected when context is nearly full.",
+        )
+        enable_facts: bool = Field(
+            default=True,
+            description="Allow explicit facts via [FACT: ...] and store them persistently.",
+        )
+        fact_max_age_days: int = Field(
+            default=90, description="Days after which a fact expires (0 = never)."
+        )
+        inject_facts_in_context: bool = Field(
+            default=True, description="Always inject stored facts into system prompt."
+        )
+        fact_importance_boost: float = Field(
+            default=1.5,
+            description="Multiplier for importance score of facts (to keep them longer).",
+        )
+        fact_command_prefix: str = Field(
+            default="/fact",
+            description="Command prefix for fact management (e.g., /fact add, /fact list, /fact remove).",
+        )
+        enable_auto_fact_detection: bool = Field(
+            default=False,
+            description="Automatically detect and store potential facts from user messages (experimental).",
         )
 
         # Selective summarization by content type
@@ -472,6 +513,7 @@ class Filter:
             "committed_changes": [],
             "message_count": 0,
             "feedback_history": [],
+            "facts": [],
             "last_compression_timestamp": 0,
         }
         self.code_pattern = re.compile(self.valves.code_block_pattern, re.DOTALL)
@@ -492,6 +534,9 @@ class Filter:
 
         if self.valves.enable_reranking and HAS_CROSS_ENCODER:
             self._load_reranker()
+
+        if self.valves.enable_facts:
+            self._log_debug("Fact storage enabled.")
 
     # --------------------------------------------------------------------------
     # LRU cache
@@ -549,6 +594,8 @@ class Filter:
             data["feedback_history"] = []
         if "last_compression_timestamp" not in data:
             data["last_compression_timestamp"] = 0
+        if "facts" not in data:
+            data["facts"] = []
         active = {}
         for k, v in data.get("active_blocks", {}).items():
             active[k] = CodeBlock(**v)
@@ -562,6 +609,7 @@ class Filter:
             "recent_changes": recent,
             "committed_changes": committed,
             "feedback_history": feedback,
+            "facts": data.get("facts", []),
             "message_count": data.get("message_count", 0),
             "last_compression_timestamp": data.get("last_compression_timestamp", 0),
         }
@@ -572,6 +620,7 @@ class Filter:
             "recent_changes": [b.dict() for b in state["recent_changes"]],
             "committed_changes": [b.dict() for b in state["committed_changes"]],
             "feedback_history": [fb.dict() for fb in state["feedback_history"]],
+            "facts": state.get("facts", []),
             "message_count": state["message_count"],
             "last_compression_timestamp": state.get("last_compression_timestamp", 0),
         }
@@ -617,6 +666,90 @@ class Filter:
                 self._log_debug(f"Purged {len(expired['ids'])} expired memories")
         except Exception as e:
             logger.warning(f"Purge failed: {e}")
+
+    # --------------------------------------------------------------------------
+    # Proactive context warning
+    # --------------------------------------------------------------------------
+    def _check_context_usage_and_warn(
+        self, system_msgs: List[dict], history_msgs: List[dict]
+    ) -> Optional[str]:
+        """Estimate token usage and return a warning message if exceeding threshold."""
+        if self.valves.proactive_context_warning_threshold <= 0:
+            return None
+        total_tokens = self._estimate_tokens(system_msgs + history_msgs)
+        max_tokens = self.valves.context_window_tokens
+        if max_tokens <= 0:
+            return None
+        usage_ratio = total_tokens / max_tokens
+        if usage_ratio >= self.valves.proactive_context_warning_threshold:
+            percent = int(usage_ratio * 100)
+            return self.valves.proactive_context_warning_message.format(
+                percent=percent, used_tokens=total_tokens, max_tokens=max_tokens
+            )
+        return None
+
+    # --------------------------------------------------------------------------
+    # Fact management
+    # --------------------------------------------------------------------------
+    def _extract_facts_from_message(self, content: str) -> List[str]:
+        pattern = r"\[FACT:\s*(.*?)\]"
+        matches = re.findall(pattern, content, re.DOTALL | re.IGNORECASE)
+        return [m.strip() for m in matches]
+
+    async def _add_fact(self, project_id: str, fact_text: str, source: str = "user"):
+        state = self._get_state(project_id)
+        if not state:
+            return
+        expires_at = None
+        if self.valves.fact_max_age_days > 0:
+            expires_at = time.time() + (self.valves.fact_max_age_days * 86400)
+        new_fact = {
+            "fact": fact_text,
+            "timestamp": time.time(),
+            "source": source,
+            "expires_at": expires_at,
+        }
+        for existing in state["facts"]:
+            if existing["fact"] == fact_text:
+                return
+        state["facts"].append(new_fact)
+        if len(state["facts"]) > 100:
+            state["facts"] = state["facts"][-100:]
+        self._set_state(project_id, state)
+        self._log_debug(f"Added fact: {fact_text[:50]}...")
+
+    async def _remove_fact(self, project_id: str, fact_text_or_index: str):
+        state = self._get_state(project_id)
+        if not state:
+            return
+        original_len = len(state["facts"])
+        if fact_text_or_index.isdigit():
+            idx = int(fact_text_or_index)
+            if 0 <= idx < len(state["facts"]):
+                state["facts"].pop(idx)
+        else:
+            state["facts"] = [
+                f for f in state["facts"] if f["fact"] != fact_text_or_index
+            ]
+        if len(state["facts"]) != original_len:
+            self._set_state(project_id, state)
+            self._log_debug(f"Removed fact: {fact_text_or_index}")
+
+    def _get_facts_context(self, project_id: str) -> str:
+        state = self._get_state(project_id)
+        if not state or not state["facts"]:
+            return ""
+        now = time.time()
+        active_facts = []
+        for f in state["facts"]:
+            if f.get("expires_at") and f["expires_at"] < now:
+                continue
+            active_facts.append(f["fact"])
+        if not active_facts:
+            return ""
+        return "## Explicitly Agreed Facts\n" + "\n".join(
+            [f"- {fact}" for fact in active_facts]
+        )
 
     # --------------------------------------------------------------------------
     # Oversized code block handling
@@ -926,13 +1059,12 @@ Example output: ["os", "Path", "utils.py", "calculate_total"]
     def _get_summary_prompt_for_content(
         self, content_type: ContentType, text: str, max_tokens: int
     ) -> str:
-        """Return a specialized summarization prompt based on content type."""
         if not self.valves.selective_summarization:
             return f"Summarise the following conversation. Keep key decisions, actions, and important context. Be concise.\n\n{text}"
 
         if content_type == ContentType.ERROR:
             if self.valves.error_preserve_verbatim:
-                return text  # no summarization
+                return text
             else:
                 return f"Summarise the following error message, keeping the error type, location, and root cause. Do not omit technical details.\n\n{text}"
         elif content_type in (
@@ -945,7 +1077,7 @@ Example output: ["os", "Path", "utils.py", "calculate_total"]
                 instruction = "Extract only the function/class signatures and the overall purpose. Do not include implementation details."
             elif level == "detailed":
                 instruction = "Summarise the code, keeping key functions, classes, important logic, and any comments. Aim for a medium level of detail."
-            else:  # balanced
+            else:
                 instruction = "Summarise the code, focusing on what it does, its main functions/classes, and any non-trivial logic."
             return f"{instruction}\n\n```\n{text[:3000]}\n```"
         elif content_type == ContentType.TOOL_CALL:
@@ -953,7 +1085,7 @@ Example output: ["os", "Path", "utils.py", "calculate_total"]
                 return text
             else:
                 return f"Summarise the following tool call sequence, keeping the tool names and main parameters.\n\n{text}"
-        else:  # GENERAL
+        else:
             return f"Summarise the following conversation, keeping key decisions, action items, and unresolved issues. Be concise (target {max_tokens} tokens).\n\n{text}"
 
     # --------------------------------------------------------------------------
@@ -1196,7 +1328,7 @@ Example output: ["os", "Path", "utils.py", "calculate_total"]
         return False
 
     # --------------------------------------------------------------------------
-    # Expiration
+    # Expiration (skip pinned blocks)
     # --------------------------------------------------------------------------
     async def _expire_blocks_by_time(self, project_id: str):
         state = self._get_state(project_id)
@@ -1206,6 +1338,8 @@ Example output: ["os", "Path", "utils.py", "calculate_total"]
         expiration_seconds = self.valves.block_expiration_hours * 3600
         to_remove = []
         for h, block in state["active_blocks"].items():
+            if block.pinned:
+                continue
             age = now - block.last_mentioned
             if (
                 block.content_type == ContentType.ERROR
@@ -1228,7 +1362,7 @@ Example output: ["os", "Path", "utils.py", "calculate_total"]
             self._set_state(project_id, state)
 
     # --------------------------------------------------------------------------
-    # Summarization helpers
+    # Summarization helpers (skip pinned blocks)
     # --------------------------------------------------------------------------
     async def _summarize_inactive_blocks_safely(self, project_id: str):
         if not self.valves.summarize_inactive_code:
@@ -1240,6 +1374,8 @@ Example output: ["os", "Path", "utils.py", "calculate_total"]
         timeout = self.valves.active_code_timeout_minutes * 60
         to_summarize = []
         for h, block in state["active_blocks"].items():
+            if block.pinned:
+                continue
             if (
                 not block.is_active
                 and (now - block.timestamp) > timeout
@@ -1294,7 +1430,7 @@ Keep the summary under 150 words.
         )
 
     # --------------------------------------------------------------------------
-    # Hierarchical compression
+    # Hierarchical compression (skip pinned messages? not needed)
     # --------------------------------------------------------------------------
     async def _hierarchical_compress(self, project_id: str, state: Dict):
         if not self.valves.hierarchical_compression_enabled:
@@ -1392,7 +1528,7 @@ Conversation segment:
         self._set_state(project_id, state)
 
     # --------------------------------------------------------------------------
-    # Duplicate removal (active state)
+    # Duplicate removal (skip pinned blocks)
     # --------------------------------------------------------------------------
     def _remove_duplicate_blocks(self, state: Dict):
         if not self.valves.auto_remove_duplicate_blocks:
@@ -1400,10 +1536,10 @@ Conversation segment:
         blocks = list(state["active_blocks"].values())
         to_remove = set()
         for i, block in enumerate(blocks):
-            if block.hash in to_remove:
+            if block.hash in to_remove or block.pinned:
                 continue
             for j, other in enumerate(blocks[i + 1 :], start=i + 1):
-                if other.hash in to_remove:
+                if other.hash in to_remove or other.pinned:
                     continue
                 sim = self._calculate_code_similarity(block.content, other.content)
                 if sim >= self.valves.code_similarity_threshold:
@@ -1645,7 +1781,7 @@ Output only JSON.
         return "\n".join(lines)
 
     # --------------------------------------------------------------------------
-    # Selective summarization for messages (overwrites previous method)
+    # Selective summarization for messages
     # --------------------------------------------------------------------------
     async def _summarize_messages(
         self, messages: List[dict], is_code_context: bool = False
@@ -1653,7 +1789,6 @@ Output only JSON.
         if not HAS_AIOHTTP or not messages:
             return None
 
-        # Determine predominant content type in the message block
         content_type_counts = defaultdict(int)
         for m in messages:
             content = m.get("content", "")
@@ -1661,22 +1796,18 @@ Output only JSON.
             ctype = self._classify_content(content, extracted)
             content_type_counts[ctype] += 1
 
-        # If errors present and preserve_verbatim, return original text (no summarization)
         if (
             self.valves.selective_summarization
             and self.valves.error_preserve_verbatim
             and content_type_counts.get(ContentType.ERROR, 0) > 0
         ):
-            # Keep error messages as-is
             return "\n".join(
                 [f"{m.get('role')}: {m.get('content', '')}" for m in messages]
             )
 
-        # Build conversation text and get appropriate prompt
         conv_text = "\n".join(
             f"{m.get('role')}: {m.get('content', '')}" for m in messages
         )
-        # Determine dominant type for prompt (or default to GENERAL)
         if content_type_counts:
             dominant_type = max(content_type_counts.items(), key=lambda x: x[1])[0]
         else:
@@ -1708,7 +1839,180 @@ Output only JSON.
         return summary
 
     # --------------------------------------------------------------------------
-    # Forget command handling
+    # Natural language remember (pin context)
+    # --------------------------------------------------------------------------
+    async def _parse_remember_intent(self, user_message: str) -> Optional[Dict]:
+        if not self.valves.enable_natural_language_forget:
+            return None
+        model = (
+            self.valves.natural_language_forget_model
+            or self.valves.llm_model
+            or self.valves.summarization_model
+        )
+        prompt = f"""You are a command interpreter for a code assistant. The user wants to **pin** or **remember** some context so that it is never discarded or summarized.
+Possible actions:
+- "pin_last": pin the last code block or the most recent context.
+- "pin_n": pin the last N code blocks (N is integer).
+- "pin_file": pin all context related to a specific file (file path provided).
+- "pin_block": pin a specific code block (by hash or by line range, or by function/class name).
+- "pin_all": pin everything currently active.
+- "unpin_last": unpin the last block.
+- "unpin_n": unpin the last N blocks.
+- "unpin_file": unpin all blocks related to a file.
+- "unpin_block": unpin a specific block.
+- "unpin_all": unpin all blocks.
+
+User message: "{user_message}"
+
+If the user clearly wants to pin/unpin something, output a JSON object with the action and relevant parameters.
+If no pinning intent, output: {{"action": "none"}}
+
+Examples:
+- "recuerda este bloque" -> {{"action": "pin_last"}}
+- "no olvides la función calcular_total" -> {{"action": "pin_block", "description": "calcular_total"}}
+- "fija el contexto del archivo main.py" -> {{"action": "pin_file", "file": "main.py"}}
+- "olvida el pin del archivo utils.py" -> {{"action": "unpin_file", "file": "utils.py"}}
+- "recuerda los últimos dos cambios" -> {{"action": "pin_n", "n": 2}}
+- "desbloquear todo" -> {{"action": "unpin_all"}}
+
+Output only JSON.
+"""
+        response = await self._call_llm(
+            prompt=prompt,
+            system_prompt="You are a precise command parser. Output only JSON.",
+            model_override=model,
+            max_tokens=150,
+            temperature=0.1,
+        )
+        if not response:
+            return None
+        try:
+            response = response.strip()
+            if response.startswith("```json"):
+                response = response[7:]
+            if response.endswith("```"):
+                response = response[:-3]
+            data = json.loads(response)
+            if data.get("action") != "none":
+                self._log_debug(f"Parsed remember intent: {data}")
+                return data
+        except:
+            pass
+        return None
+
+    async def _execute_remember_intent(self, project_id: str, intent: Dict) -> str:
+        state = self._get_state(project_id)
+        if not state:
+            return "No active context to pin/unpin."
+
+        def set_pinned(blocks, pinned_value):
+            count = 0
+            for blk in blocks:
+                blk.pinned = pinned_value
+                if pinned_value:
+                    blk.importance_score = 10.0
+                else:
+                    blk._update_importance()
+                count += 1
+            return count
+
+        action = intent.get("action", "")
+        if action == "pin_last":
+            if state["active_blocks"]:
+                last_hash = max(
+                    state["active_blocks"].keys(),
+                    key=lambda h: state["active_blocks"][h].timestamp,
+                )
+                set_pinned([state["active_blocks"][last_hash]], True)
+                return "Pinned last code block."
+            return "No blocks to pin."
+        elif action == "pin_n":
+            n = intent.get("n", 1)
+            blocks_by_time = sorted(
+                state["active_blocks"].values(), key=lambda b: b.timestamp, reverse=True
+            )
+            to_pin = blocks_by_time[:n]
+            count = set_pinned(to_pin, True)
+            return f"Pinned {count} blocks."
+        elif action == "pin_file":
+            file_path = intent.get("file", "")
+            if not file_path:
+                return "No file specified."
+            to_pin = [
+                blk
+                for blk in state["active_blocks"].values()
+                if blk.file_path and file_path in blk.file_path
+            ]
+            count = set_pinned(to_pin, True)
+            return f"Pinned {count} blocks related to {file_path}."
+        elif action == "pin_block":
+            desc = intent.get("description", "") or intent.get("hash", "")
+            if not desc:
+                return "No block identifier."
+            matches = []
+            for blk in state["active_blocks"].values():
+                if (
+                    desc in blk.content
+                    or (blk.hash and desc in blk.hash)
+                    or (blk.file_path and desc in blk.file_path)
+                ):
+                    matches.append(blk)
+            count = set_pinned(matches, True)
+            return f"Pinned {count} blocks matching '{desc}'."
+        elif action == "pin_all":
+            count = set_pinned(list(state["active_blocks"].values()), True)
+            return f"Pinned all {count} active blocks."
+
+        elif action == "unpin_last":
+            if state["active_blocks"]:
+                last_hash = max(
+                    state["active_blocks"].keys(),
+                    key=lambda h: state["active_blocks"][h].timestamp,
+                )
+                set_pinned([state["active_blocks"][last_hash]], False)
+                return "Unpinned last code block."
+            return "No blocks to unpin."
+        elif action == "unpin_n":
+            n = intent.get("n", 1)
+            blocks_by_time = sorted(
+                state["active_blocks"].values(), key=lambda b: b.timestamp, reverse=True
+            )
+            to_unpin = blocks_by_time[:n]
+            count = set_pinned(to_unpin, False)
+            return f"Unpinned {count} blocks."
+        elif action == "unpin_file":
+            file_path = intent.get("file", "")
+            if not file_path:
+                return "No file specified."
+            to_unpin = [
+                blk
+                for blk in state["active_blocks"].values()
+                if blk.file_path and file_path in blk.file_path
+            ]
+            count = set_pinned(to_unpin, False)
+            return f"Unpinned {count} blocks related to {file_path}."
+        elif action == "unpin_block":
+            desc = intent.get("description", "") or intent.get("hash", "")
+            if not desc:
+                return "No block identifier."
+            matches = []
+            for blk in state["active_blocks"].values():
+                if (
+                    desc in blk.content
+                    or (blk.hash and desc in blk.hash)
+                    or (blk.file_path and desc in blk.file_path)
+                ):
+                    matches.append(blk)
+            count = set_pinned(matches, False)
+            return f"Unpinned {count} blocks matching '{desc}'."
+        elif action == "unpin_all":
+            count = set_pinned(list(state["active_blocks"].values()), False)
+            return f"Unpinned all {count} blocks."
+        else:
+            return "Unrecognized pin action."
+
+    # --------------------------------------------------------------------------
+    # Forget command handling (unchanged)
     # --------------------------------------------------------------------------
     async def _parse_forget_intent(self, user_message: str) -> Optional[Dict]:
         if not self.valves.enable_natural_language_forget:
@@ -1876,7 +2180,6 @@ Output only JSON.
         if not self.valves.enable_code_awareness:
             return
         state = self._get_state(project_id)
-        # Remove duplicate blocks periodically
         if self.valves.auto_remove_duplicate_blocks:
             self._remove_duplicate_blocks(state)
 
@@ -1896,7 +2199,6 @@ Output only JSON.
                 block.last_mentioned = time.time()
                 block._update_importance()
 
-        # Run async extract in a new event loop (simplified)
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         extracted = loop.run_until_complete(self._extract_code_blocks(content))
@@ -1924,12 +2226,14 @@ Output only JSON.
                 mention_count=1,
                 dependencies=[],
                 potentially_affected=False,
+                pinned=False,
             )
 
             if "[KEEP]" in content or "#important" in content.lower():
                 new_block.importance_score = 10.0
+                new_block.pinned = True
                 self._log_debug(
-                    f"Manual importance marker detected for block {new_block.hash}"
+                    f"Manual importance marker detected for block {new_block.hash}, pinned automatically"
                 )
 
             is_dup, existing = self._is_duplicate_code(
@@ -2075,7 +2379,6 @@ Output only JSON.
 
         state["message_count"] += 1
 
-        # Remove duplicates again after modifications
         if self.valves.auto_remove_duplicate_blocks:
             self._remove_duplicate_blocks(state)
 
@@ -2144,11 +2447,12 @@ Output only JSON.
                     if b.file_path
                     else ""
                 )
+                pin = " [PINNED]" if b.pinned else ""
                 aff = (
                     " [AFFECTED BY DEPENDENCY CHANGE]" if b.potentially_affected else ""
                 )
                 parts.append(
-                    f"```\n{b.content[:600]}\n```{loc}  (importance: {b.importance_score:.1f}){aff}"
+                    f"```\n{b.content[:600]}\n```{loc}  (importance: {b.importance_score:.1f}){aff}{pin}"
                 )
         if proposed:
             parts.append("### Proposed Changes (pending review):")
@@ -2297,6 +2601,31 @@ Output only JSON.
                 body["messages"] = new_messages
                 return body
 
+        # Handle remember (pin) commands via natural language
+        if self.valves.enable_natural_language_forget:
+            last_user_msg = (
+                messages[-1]
+                if messages and messages[-1].get("role") == "user"
+                else None
+            )
+            if last_user_msg:
+                remember_intent = await self._parse_remember_intent(
+                    last_user_msg.get("content", "")
+                )
+                if (
+                    remember_intent
+                    and remember_intent.get("action")
+                    and remember_intent["action"] != "none"
+                ):
+                    confirmation = await self._execute_remember_intent(
+                        project_id, remember_intent
+                    )
+                    new_messages = messages + [
+                        {"role": "assistant", "content": confirmation}
+                    ]
+                    body["messages"] = new_messages
+                    return body
+
         # Smart context selection
         if self.valves.smart_context_selection and len(messages) > 0:
             last_user_idx = -1
@@ -2346,6 +2675,57 @@ Output only JSON.
                         feedback_intent.get("outcome"),
                         feedback_intent.get("comment", ""),
                     )
+
+        # Handle fact commands (/fact add/list/remove)
+        if self.valves.enable_facts:
+            last_user_msg = (
+                messages[-1]
+                if messages and messages[-1].get("role") == "user"
+                else None
+            )
+            if last_user_msg and last_user_msg.get("content", "").startswith(
+                self.valves.fact_command_prefix
+            ):
+                parts = last_user_msg["content"].split(maxsplit=2)
+                if len(parts) >= 2:
+                    subcmd = parts[1].lower()
+                    if subcmd == "add" and len(parts) >= 3:
+                        await self._add_fact(project_id, parts[2], "command")
+                        messages.pop()
+                        messages.append(
+                            {
+                                "role": "assistant",
+                                "content": f"Fact added: {parts[2][:100]}",
+                            }
+                        )
+                        body["messages"] = messages
+                        return body
+                    elif subcmd == "remove" and len(parts) >= 3:
+                        await self._remove_fact(project_id, parts[2])
+                        messages.pop()
+                        messages.append(
+                            {
+                                "role": "assistant",
+                                "content": f"Fact removed: {parts[2][:100]}",
+                            }
+                        )
+                        body["messages"] = messages
+                        return body
+                    elif subcmd == "list":
+                        facts = self._get_facts_context(project_id)
+                        messages.pop()
+                        messages.append(
+                            {
+                                "role": "assistant",
+                                "content": (
+                                    f"Stored facts:\n{facts}"
+                                    if facts
+                                    else "No facts stored."
+                                ),
+                            }
+                        )
+                        body["messages"] = messages
+                        return body
 
         # Update active code from recent messages
         if self.valves.enable_code_awareness:
@@ -2400,6 +2780,28 @@ Output only JSON.
                     messages.insert(0, {"role": "system", "content": active_ctx})
                 body["messages"] = messages
 
+        # Inject facts into system prompt
+        if self.valves.enable_facts and self.valves.inject_facts_in_context:
+            facts_ctx = self._get_facts_context(project_id)
+            if facts_ctx:
+                sys_msgs = [m for m in messages if m.get("role") == "system"]
+                if sys_msgs:
+                    sys_msgs[0]["content"] = facts_ctx + "\n\n" + sys_msgs[0]["content"]
+                else:
+                    messages.insert(0, {"role": "system", "content": facts_ctx})
+                body["messages"] = messages
+
+        # Inject confidence instruction into system prompt if enabled
+        if self.valves.enable_confidence_scoring:
+            sys_msgs = [m for m in messages if m.get("role") == "system"]
+            if sys_msgs:
+                sys_msgs[0]["content"] += self.valves.confidence_prompt
+            else:
+                messages.insert(
+                    0, {"role": "system", "content": self.valves.confidence_prompt}
+                )
+                body["messages"] = messages
+
         # Inject feedback context
         if self.valves.enable_feedback_tracking and self.valves.inject_feedback_context:
             feedback_ctx = self._get_feedback_context(project_id)
@@ -2430,6 +2832,15 @@ Output only JSON.
             eff_max = user_max if user_max is not None else self.valves.max_turns
             if len(history_msgs) > eff_max:
                 trim_needed = True
+
+        # Proactive context warning (must be after token estimate)
+        warning = self._check_context_usage_and_warn(system_msgs, history_msgs)
+        if warning:
+            messages.insert(0, {"role": "system", "content": warning})
+            body["messages"] = messages
+            # Re-fetch system and history after inserting warning
+            system_msgs = [m for m in messages if m.get("role") == "system"]
+            history_msgs = [m for m in messages if m.get("role") != "system"]
 
         if trim_needed and len(history_msgs) > self.valves.max_turns:
             keep = self.valves.max_turns
