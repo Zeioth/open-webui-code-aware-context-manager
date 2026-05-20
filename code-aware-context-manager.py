@@ -226,8 +226,10 @@ class Filter:
             default=100,
             description="Number of messages after which to trigger compression.",
         )
+        # MODELO -> default cambiado
         hierarchical_summary_model: str = Field(
-            default="", description="Model for hierarchical summaries."
+            default="ollama/llama3.2:3B",
+            description="Model for hierarchical summaries.",
         )
         hierarchical_summary_max_tokens: int = Field(
             default=800, description="Max tokens for hierarchical summary."
@@ -257,6 +259,27 @@ class Filter:
         confidence_prompt: str = Field(
             default="\n\nAfter your response, on a new line, output '[Confidence: XX%]' where XX is your estimated confidence (0-100) in the correctness and completeness of your answer, based on the available context. If you lack information, give lower confidence and suggest what context would help.",
             description="Suffix added to system prompt to request confidence.",
+        )
+        enable_cot_on_demand: bool = Field(
+            default=True, description="Enable /think command for chain-of-thought."
+        )
+        cot_model: str = Field(
+            default="ollama/llama3.2:3B",
+            description="Model for chain-of-thought reasoning.",
+        )
+        enable_assumption_extraction: bool = Field(
+            default=True, description="Enable /assume command."
+        )
+        assumption_extraction_model: str = Field(
+            default="ollama/llama3.2:3B",
+            description="Model for assumption extraction.",
+        )
+        enable_contradiction_detection: bool = Field(
+            default=True, description="Detect contradictions in conversation."
+        )
+        contradiction_detection_model: str = Field(
+            default="ollama/llama3.2:3B",
+            description="Model for contradiction detection.",
         )
         proactive_context_warning_threshold: float = Field(
             default=0.85,
@@ -301,11 +324,13 @@ class Filter:
         iterative_diff_format: str = Field(
             default="unified", description="Diff format: 'unified' or 'context'."
         )
+        # MODELOS con nuevo default
         iterative_planning_model: str = Field(
-            default="", description="Model for planning (if empty, uses llm_model)."
+            default="ollama/llama3.2:3B",
+            description="Model for planning (if empty, uses llm_model).",
         )
         iterative_execution_model: str = Field(
-            default="",
+            default="ollama/llama3.2:3B",
             description="Model for step execution (if empty, uses same as planning).",
         )
         iterative_resume_command: str = Field(
@@ -412,8 +437,9 @@ class Filter:
             default=True,
             description="Always extract function/class signatures even when summarizing code.",
         )
+        # MODELO con default
         summary_fallback_model: str = Field(
-            default="",
+            default="ollama/llama3.2:3B",
             description="Model for selective summarization (if empty, uses summarization_model).",
         )
         summary_include_metadata: bool = Field(
@@ -424,7 +450,7 @@ class Filter:
             default=True, description="Summarize discarded message blocks."
         )
         summarization_model: str = Field(
-            default="gpt-3.5-turbo", description="Default summarization model."
+            default="ollama/llama3.2:3B", description="Default summarization model."
         )
         openai_api_base: str = Field(
             default=os.getenv("OPENAI_API_BASE", "http://localhost:8080/v1"),
@@ -474,7 +500,6 @@ class Filter:
             description="Regex for file paths.",
         )
 
-        # Oversized code block handling
         max_code_block_tokens: int = Field(
             default=20000, description="Maximum tokens for a code block (0 = no limit)."
         )
@@ -483,7 +508,8 @@ class Filter:
             description="Action for oversized blocks: 'truncate', 'summarize', or 'warn'.",
         )
         code_block_summary_model: str = Field(
-            default="", description="Model for summarizing oversized blocks."
+            default="ollama/llama3.2:3B",
+            description="Model for summarizing oversized blocks.",
         )
         code_block_truncate_keep_head: int = Field(
             default=50, description="Lines to keep from beginning when truncating."
@@ -581,11 +607,12 @@ class Filter:
             default=True, description="Summarize inactive code blocks."
         )
         inactive_code_summary_model: str = Field(
-            default="gpt-3.5-turbo", description="Model for inactive code summaries."
+            default="ollama/llama3.2:3B",
+            description="Model for inactive code summaries.",
         )
 
         llm_model: str = Field(
-            default="",
+            default="ollama/llama3.2:3B",
             description="Preferred model (e.g., 'ollama/llama3.2:3b'). Falls back to summarization_model.",
         )
 
@@ -596,7 +623,7 @@ class Filter:
             default=True, description="Interpret natural language forget."
         )
         natural_language_forget_model: str = Field(
-            default="", description="Model for forget intent parsing."
+            default="ollama/llama3.2:3B", description="Model for forget intent parsing."
         )
 
     class UserValves(BaseModel):
@@ -754,7 +781,8 @@ class Filter:
     # --------------------------------------------------------------------------
     def _log_debug(self, msg: str):
         if self.valves.debug:
-            logger.debug(msg)
+            print(f"[CodeAware] {msg}")
+            logger.info(msg)
 
     # --------------------------------------------------------------------------
     # LTM initialization
