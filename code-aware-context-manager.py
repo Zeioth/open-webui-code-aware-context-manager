@@ -1,10 +1,10 @@
 """
-title: Code-Aware Context Manager with LTM & Summarization (v5.10)
-description: Full-featured context manager for coding assistants. Persists state, tracks line ranges, applies diffs, compresses LTM, scores importance, learns from assistant responses, summarizes inactive code, supports manual importance markers, robust LLM fallback, natural language forget commands, feedback tracking, hierarchical project-based memory, LRU cache, optional reranking, semantic dependency tracking, and automatic handling of oversized code blocks.
+title: Code-Aware Context Manager with LTM & Summarization (v5.13)
+description: Full-featured context manager for coding assistants. Persists state, tracks line ranges, applies diffs, compresses LTM, scores importance, learns from assistant responses, summarizes inactive code, supports manual importance markers, robust LLM fallback, natural language forget commands, feedback tracking, hierarchical project-based memory, LRU cache, optional reranking, semantic dependency tracking, automatic handling of oversized code blocks, smart context selection, hierarchical conversation compression, automatic duplicate removal, and frequency-based prioritization.
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.10.0
+version: 5.13.0
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz
 """
@@ -191,6 +191,53 @@ class Filter:
         )
         reranker_top_k: int = Field(
             default=5, description="Number of results after reranking."
+        )
+
+        # Smart context selection (replaces sliding window)
+        smart_context_selection: bool = Field(
+            default=False,
+            description="Replace sliding window with semantic retrieval from conversation history.",
+        )
+        smart_context_top_k: int = Field(
+            default=15, description="Number of past messages to retrieve."
+        )
+        smart_context_min_tokens: int = Field(
+            default=1024, description="Minimum tokens to aim for."
+        )
+        smart_context_include_last_user: bool = Field(
+            default=True, description="Always include last user message."
+        )
+
+        # Hierarchical compression
+        hierarchical_compression_enabled: bool = Field(
+            default=False,
+            description="Periodically compress old conversation segments.",
+        )
+        hierarchical_compression_interval_messages: int = Field(
+            default=100, description="Messages after which to trigger compression."
+        )
+        hierarchical_summary_model: str = Field(
+            default="", description="Model for hierarchical summaries."
+        )
+        hierarchical_summary_max_tokens: int = Field(
+            default=800, description="Max tokens for summary."
+        )
+
+        # Duplicate removal and frequency prioritization
+        auto_remove_duplicate_blocks: bool = Field(
+            default=True, description="Auto-remove older duplicate code blocks."
+        )
+        max_duplicate_age_hours: float = Field(
+            default=6.0, description="Max age diff for considering duplicates."
+        )
+        frequency_weight_factor: float = Field(
+            default=0.3, description="Weight for mention frequency in importance."
+        )
+        min_mentions_for_boost: int = Field(
+            default=3, description="Min mentions to apply frequency boost."
+        )
+        frequency_decay_hours: float = Field(
+            default=12.0, description="Half-life for frequency boost."
         )
 
         summarize_old_messages: bool = Field(
@@ -389,6 +436,7 @@ class Filter:
             "committed_changes": [],
             "message_count": 0,
             "feedback_history": [],
+            "last_compression_timestamp": 0,
         }
         self.code_pattern = re.compile(self.valves.code_block_pattern, re.DOTALL)
         self.diff_pattern = re.compile(self.valves.diff_pattern)
@@ -463,6 +511,8 @@ class Filter:
         data = json.loads(row[0])
         if "feedback_history" not in data:
             data["feedback_history"] = []
+        if "last_compression_timestamp" not in data:
+            data["last_compression_timestamp"] = 0
         active = {}
         for k, v in data.get("active_blocks", {}).items():
             active[k] = CodeBlock(**v)
@@ -477,6 +527,7 @@ class Filter:
             "committed_changes": committed,
             "feedback_history": feedback,
             "message_count": data.get("message_count", 0),
+            "last_compression_timestamp": data.get("last_compression_timestamp", 0),
         }
 
     def _save_state_to_db(self, project_id: str, state: Dict):
@@ -486,6 +537,7 @@ class Filter:
             "committed_changes": [b.dict() for b in state["committed_changes"]],
             "feedback_history": [fb.dict() for fb in state["feedback_history"]],
             "message_count": state["message_count"],
+            "last_compression_timestamp": state.get("last_compression_timestamp", 0),
         }
         self._db_conn.execute(
             "REPLACE INTO conversation_state (project_id, state_json, updated_at) VALUES (?, ?, ?)",
@@ -499,6 +551,36 @@ class Filter:
     def _log_debug(self, msg: str):
         if self.valves.debug:
             logger.debug(msg)
+
+    # --------------------------------------------------------------------------
+    # LTM initialization
+    # --------------------------------------------------------------------------
+    def _init_long_term_memory(self):
+        os.makedirs(self.valves.long_term_memory_dir, exist_ok=True)
+        self.embedder = SentenceTransformer("all-MiniLM-L6-v2")
+        self.chroma_client = chromadb.PersistentClient(
+            path=self.valves.long_term_memory_dir,
+            settings=Settings(anonymized_telemetry=False),
+        )
+        self.memory_collection = self.chroma_client.get_or_create_collection(
+            name="conversation_memory", metadata={"hnsw:space": "cosine"}
+        )
+        self._purge_expired_memories()
+        self._log_debug("LTM ready")
+
+    def _purge_expired_memories(self):
+        if not HAS_CHROMA or self.memory_collection is None:
+            return
+        if self.valves.long_term_memory_expiration_days <= 0:
+            return
+        try:
+            now = datetime.utcnow().isoformat()
+            expired = self.memory_collection.get(where={"expires_at": {"$lt": now}})
+            if expired and expired["ids"]:
+                self.memory_collection.delete(ids=expired["ids"])
+                self._log_debug(f"Purged {len(expired['ids'])} expired memories")
+        except Exception as e:
+            logger.warning(f"Purge failed: {e}")
 
     # --------------------------------------------------------------------------
     # Oversized code block handling
@@ -1140,408 +1222,206 @@ Keep the summary under 150 words.
         )
 
     # --------------------------------------------------------------------------
-    # Active code tracking (main)
+    # Hierarchical compression
     # --------------------------------------------------------------------------
-    def _update_active_code(self, message: dict, project_id: str):
-        if not self.valves.enable_code_awareness:
+    async def _hierarchical_compress(self, project_id: str, state: Dict):
+        if not self.valves.hierarchical_compression_enabled:
             return
-        asyncio.create_task(self._summarize_inactive_blocks_safely(project_id))
-        state = self._get_state(project_id)
-        content = message.get("content", "")
-        role = message.get("role", "")
-
-        self._update_mentions_from_message(state, content)
-
-        for block in state["active_blocks"].values():
-            if (
-                block.content
-                and self._calculate_code_similarity(block.content[:200], content[:200])
-                > 0.7
-            ):
-                block.mention_count += 1
-                block.last_mentioned = time.time()
-                block._update_importance()
-
-        extracted = asyncio.run(self._extract_code_blocks(content))
-        if not content and not extracted:
+        last_ts = state.get("last_compression_timestamp", 0)
+        if time.time() - last_ts < 3600:
             return
 
-        content_type = self._classify_content(content, extracted)
-        file_path, line_start, line_end = self._extract_line_range(content)
-
-        for block_info in extracted:
-            blk_file = file_path or (
-                self._extract_file_paths(content)[0]
-                if self.valves.track_file_paths
-                else None
-            )
-            new_block = CodeBlock(
-                content=block_info["code"],
-                content_type=content_type,
-                generated_by_assistant=(role == "assistant"),
-                file_path=blk_file,
-                line_range=(line_start, line_end) if line_start and line_end else None,
-                timestamp=time.time(),
-                is_active=True,
-                mention_count=1,
-                dependencies=[],
-                potentially_affected=False,
-            )
-
-            if "[KEEP]" in content or "#important" in content.lower():
-                new_block.importance_score = 10.0
-                self._log_debug(
-                    f"Manual importance marker detected for block {new_block.hash}"
-                )
-
-            is_dup, existing = self._is_duplicate_code(
-                new_block, list(state["active_blocks"].values())
-            )
-            if is_dup and existing:
-                if self.valves.prioritize_recent_code:
-                    existing.content = new_block.content
-                    existing.hash = new_block.hash
-                    existing.timestamp = time.time()
-                    existing.mention_count += 1
-                    existing.last_mentioned = time.time()
-                    existing._update_importance()
-                    self._log_debug(f"Updated existing block {existing.hash}")
-                    if (
-                        self.valves.enable_dependency_tracking
-                        and self.valves.dependency_refresh_on_update
-                    ):
-                        asyncio.create_task(
-                            self._refresh_dependencies_for_block(
-                                existing.hash, project_id
-                            )
-                        )
-                continue
-
-            if (
-                content_type == ContentType.PROPOSED_CHANGE
-                and self._has_conflicting_proposed_changes(state, new_block)
-            ):
-                new_block.importance_score = max(new_block.importance_score, 7.0)
-                self._log_debug(
-                    f"Proposed change {new_block.hash} marked as conflicting"
-                )
-
-            state["active_blocks"][new_block.hash] = new_block
-            self._log_debug(f"New {content_type.value} block: {new_block.hash}")
-
-            if content_type == ContentType.PROPOSED_CHANGE:
-                state["recent_changes"].append(new_block)
-                conflict = self._has_conflicting_proposed_changes(state, new_block)
-                if self.valves.enable_diff_application and not conflict:
-                    for base in list(state["active_blocks"].values()):
-                        if (
-                            base.content_type == ContentType.BASE_CODE
-                            and base.file_path == new_block.file_path
-                        ):
-                            if self._apply_change_with_diff(base, new_block):
-                                state["recent_changes"] = [
-                                    c
-                                    for c in state["recent_changes"]
-                                    if c.hash != new_block.hash
-                                ]
-                                state["committed_changes"].append(new_block)
-                                break
-                else:
-                    self._log_debug(
-                        f"Skipped auto-apply for conflicting proposed change {new_block.hash}"
-                    )
-            elif content_type == ContentType.COMMITTED_CHANGE:
-                state["committed_changes"].append(new_block)
-            elif (
-                content_type == ContentType.ERROR and self.valves.preserve_error_context
-            ):
-                new_block.importance_score = min(new_block.importance_score + 3.0, 10.0)
-
-            if len(state["recent_changes"]) > self.valves.max_proposed_changes:
-                state["recent_changes"] = sorted(
-                    state["recent_changes"],
-                    key=lambda b: b.importance_score,
-                    reverse=True,
-                )[: self.valves.max_proposed_changes]
-            if len(state["committed_changes"]) > self.valves.max_committed_changes:
-                state["committed_changes"] = sorted(
-                    state["committed_changes"],
-                    key=lambda b: b.importance_score,
-                    reverse=True,
-                )[: self.valves.max_committed_changes]
-            if len(state["active_blocks"]) > self.valves.max_active_blocks:
-                sorted_blocks = sorted(
-                    state["active_blocks"].values(),
-                    key=lambda b: b.importance_score,
-                    reverse=True,
-                )
-                keep = sorted_blocks[: self.valves.max_active_blocks]
-                state["active_blocks"] = {b.hash: b for b in keep}
-
-            # Extract dependencies for new blocks (non-blocking)
-            if self.valves.enable_dependency_tracking and content_type in (
-                ContentType.BASE_CODE,
-                ContentType.PROPOSED_CHANGE,
-                ContentType.COMMITTED_CHANGE,
-            ):
-                asyncio.create_task(
-                    self._refresh_dependencies_for_block(new_block.hash, project_id)
-                )
-
-        # Assistant learning: update best matching base block
-        if role == "assistant" and len(extracted) > 0:
-            for block_info in extracted:
-                best_base = None
-                best_sim = 0.0
-                for base in state["active_blocks"].values():
-                    if base.content_type == ContentType.BASE_CODE:
-                        if base.file_path and file_path and base.file_path == file_path:
-                            sim = self._calculate_code_similarity(
-                                base.content, block_info["code"]
-                            )
-                            if sim > best_sim:
-                                best_sim = sim
-                                best_base = base
-                        else:
-                            sim = self._calculate_code_similarity(
-                                base.content, block_info["code"]
-                            )
-                            if sim > best_sim and sim > 0.6:
-                                best_sim = sim
-                                best_base = base
-                if best_base and best_sim > 0.6 and best_sim < 0.95:
-                    best_base.content = block_info["code"]
-                    best_base.hash = hashlib.md5(
-                        block_info["code"].encode()
-                    ).hexdigest()[:16]
-                    best_base.timestamp = time.time()
-                    best_base.is_active = True
-                    best_base.potentially_affected = False
-                    best_base.importance_score = min(
-                        best_base.importance_score + 1.0, 10.0
-                    )
-                    self._log_debug(
-                        f"Assistant updated base code block {best_base.hash} (sim={best_sim:.2f})"
-                    )
-                    if (
-                        self.valves.enable_dependency_tracking
-                        and self.valves.dependency_refresh_on_update
-                    ):
-                        asyncio.create_task(
-                            self._refresh_dependencies_for_block(
-                                best_base.hash, project_id
-                            )
-                        )
-
-        state["message_count"] += 1
-        asyncio.create_task(self._expire_blocks_by_time(project_id))
-        asyncio.create_task(self._clean_affected_flags(project_id))
-        self._set_state(project_id, state)
-
-    def _is_duplicate_code(
-        self, new_block: CodeBlock, existing_blocks: List[CodeBlock]
-    ) -> Tuple[bool, Optional[CodeBlock]]:
-        for ex in existing_blocks:
-            sim = self._calculate_code_similarity(new_block.content, ex.content)
-            if sim >= self.valves.code_similarity_threshold:
-                return True, ex
-        return False, None
-
-    def _get_active_code_context(self, project_id: str) -> str:
-        state = self._get_state(project_id)
-        if not state or not state["active_blocks"]:
-            return ""
-        now = time.time()
-        active = []
-        for block in state["active_blocks"].values():
-            if not block.is_active and self.valves.track_active_code_age:
-                if now - block.timestamp > self.valves.active_code_timeout_minutes * 60:
-                    continue
-            active.append(block)
-        if not active:
-            return ""
-        active.sort(key=lambda b: b.importance_score, reverse=True)
-        base_codes = [b for b in active if b.content_type == ContentType.BASE_CODE][
-            : self.valves.max_base_code_blocks
-        ]
-        proposed = [b for b in active if b.content_type == ContentType.PROPOSED_CHANGE][
-            : self.valves.max_proposed_changes
-        ]
-        committed = [
-            b for b in active if b.content_type == ContentType.COMMITTED_CHANGE
-        ][: self.valves.max_committed_changes]
-        errors = (
-            [b for b in active if b.content_type == ContentType.ERROR][:3]
-            if self.valves.preserve_error_context
-            else []
-        )
-
-        parts = ["## Currently Active Code Context (by importance)\n"]
-        if base_codes:
-            parts.append("### Base Code (current work):")
-            for b in base_codes:
-                loc = (
-                    f" (file: {b.file_path}"
-                    + (
-                        f", lines {b.line_range[0]}-{b.line_range[1]}"
-                        if b.line_range
-                        else ""
-                    )
-                    + ")"
-                    if b.file_path
-                    else ""
-                )
-                aff = (
-                    " [AFFECTED BY DEPENDENCY CHANGE]" if b.potentially_affected else ""
-                )
-                parts.append(
-                    f"```\n{b.content[:600]}\n```{loc}  (importance: {b.importance_score:.1f}){aff}"
-                )
-        if proposed:
-            parts.append("### Proposed Changes (pending review):")
-            for b in proposed:
-                parts.append(f"```diff\n{b.content[:500]}\n```")
-        if committed:
-            parts.append("### Recently Committed Changes:")
-            for b in committed:
-                parts.append(f"```\n{b.content[:300]}\n```")
-        if errors:
-            parts.append("### Recent Errors:")
-            for b in errors:
-                parts.append(f"```\n{b.content[:500]}\n```")
-        return "\n".join(parts)
-
-    # --------------------------------------------------------------------------
-    # Token estimation
-    # --------------------------------------------------------------------------
-    def _estimate_tokens(self, messages: List[dict]) -> int:
-        if self.tokenizer:
-            total = 0
-            for m in messages:
-                content = str(m.get("content", ""))
-                total += len(self.tokenizer.encode(content))
-                total += 4
-            return total
-        total_chars = sum(len(str(m.get("content", ""))) for m in messages)
-        total_chars += sum(30 for _ in messages)
-        return total_chars // 4
-
-    # --------------------------------------------------------------------------
-    # LTM with compression
-    # --------------------------------------------------------------------------
-    def _init_long_term_memory(self):
-        os.makedirs(self.valves.long_term_memory_dir, exist_ok=True)
-        self.embedder = SentenceTransformer("all-MiniLM-L6-v2")
-        self.chroma_client = chromadb.PersistentClient(
-            path=self.valves.long_term_memory_dir,
-            settings=Settings(anonymized_telemetry=False),
-        )
-        self.memory_collection = self.chroma_client.get_or_create_collection(
-            name="conversation_memory", metadata={"hnsw:space": "cosine"}
-        )
-        self._purge_expired_memories()
-        self._log_debug("LTM ready")
-
-    def _purge_expired_memories(self):
-        if not HAS_CHROMA or self.memory_collection is None:
-            return
-        if self.valves.long_term_memory_expiration_days <= 0:
-            return
         try:
-            now = datetime.utcnow().isoformat()
-            expired = self.memory_collection.get(where={"expires_at": {"$lt": now}})
-            if expired and expired["ids"]:
-                self.memory_collection.delete(ids=expired["ids"])
-                self._log_debug(f"Purged {len(expired['ids'])} expired memories")
+            where_filter = {
+                "project_id": project_id,
+                "$and": [
+                    {"is_hierarchical_summary": {"$ne": True}},
+                    {"timestamp": {"$lt": datetime.utcnow().isoformat()}},
+                ],
+            }
+            results = self.memory_collection.get(
+                where=where_filter,
+                include=["documents", "metadatas", "ids"],
+                limit=self.valves.hierarchical_compression_interval_messages * 2,
+            )
         except Exception as e:
-            logger.warning(f"Purge failed: {e}")
+            self._log_debug(
+                f"Failed to fetch messages for hierarchical compression: {e}"
+            )
+            return
 
-    def _store_message_in_memory(self, message: dict, project_id: str):
-        if not HAS_SENTENCE or not HAS_CHROMA or self.memory_collection is None:
+        if (
+            not results
+            or not results["ids"]
+            or len(results["ids"])
+            < self.valves.hierarchical_compression_interval_messages
+        ):
             return
-        content = message.get("content", "")
-        if not content or len(content.strip()) < 15:
+
+        pairs = sorted(
+            zip(results["ids"], results["documents"], results["metadatas"]),
+            key=lambda x: x[2].get("timestamp", ""),
+        )
+        to_compress = pairs[: self.valves.hierarchical_compression_interval_messages]
+
+        texts = "\n---\n".join([doc for _, doc, _ in to_compress])
+        model = (
+            self.valves.hierarchical_summary_model
+            or self.valves.llm_model
+            or self.valves.summarization_model
+        )
+        prompt = f"""Summarise the following conversation segment, focusing on:
+- Key technical decisions
+- Code changes and their outcomes
+- Problems solved or still open
+- Important context for future interactions
+
+Keep the summary concise (max {self.valves.hierarchical_summary_max_tokens // 4} words).
+
+Conversation segment:
+{texts[:4000]}
+"""
+        summary = await self._call_llm(
+            prompt=prompt,
+            system_prompt="You are a code-aware assistant creating concise hierarchical summaries.",
+            model_override=model,
+            max_tokens=self.valves.hierarchical_summary_max_tokens,
+            temperature=0.2,
+        )
+        if not summary:
+            self._log_debug("Hierarchical compression: summarization failed.")
             return
-        extracted = asyncio.run(self._extract_code_blocks(content))
-        content_type = self._classify_content(content, extracted)
-        msg_id = f"{project_id}_{int(time.time())}_{hashlib.md5(content.encode()).hexdigest()[:8]}"
-        expires_at = None
-        if self.valves.long_term_memory_expiration_days > 0:
-            expires_at = (
-                datetime.utcnow()
-                + timedelta(days=self.valves.long_term_memory_expiration_days)
-            ).isoformat()
-        embedding = self.embedder.encode(content).tolist()
+
+        summary_id = f"{project_id}_hierarchical_{int(time.time())}"
+        summary_embedding = self.embedder.encode(summary).tolist()
         self.memory_collection.upsert(
-            ids=[msg_id],
-            embeddings=[embedding],
+            ids=[summary_id],
+            embeddings=[summary_embedding],
             metadatas=[
                 {
-                    "role": message.get("role"),
+                    "role": "assistant",
                     "project_id": project_id,
                     "timestamp": datetime.utcnow().isoformat(),
-                    "expires_at": expires_at,
-                    "content_type": content_type.value,
-                    "has_code": len(extracted) > 0,
+                    "is_hierarchical_summary": True,
+                    "summary_level": 1,
+                    "source_message_ids": ",".join(
+                        [id for id, _, _ in to_compress][:5]
+                    ),
                 }
             ],
-            documents=[content],
+            documents=[
+                f"[Hierarchical summary of {len(to_compress)} messages]\n{summary}"
+            ],
         )
-        self._log_debug(f"Stored message {msg_id} in LTM")
+        self._log_debug(
+            f"Hierarchical compression: created summary for {len(to_compress)} messages"
+        )
+        state["last_compression_timestamp"] = time.time()
+        self._set_state(project_id, state)
 
-        state = self._get_state(project_id)
-        msg_count = state.get("message_count", 0)
-        if msg_count > 0 and msg_count % self.valves.ltm_compress_after_messages == 0:
-            asyncio.create_task(self._compress_ltm_for_conversation(project_id))
-
-    async def _compress_ltm_for_conversation(self, project_id: str):
-        if not HAS_AIOHTTP or not self.memory_collection:
+    # --------------------------------------------------------------------------
+    # Duplicate removal (active state)
+    # --------------------------------------------------------------------------
+    def _remove_duplicate_blocks(self, state: Dict):
+        if not self.valves.auto_remove_duplicate_blocks:
             return
+        blocks = list(state["active_blocks"].values())
+        to_remove = set()
+        for i, block in enumerate(blocks):
+            if block.hash in to_remove:
+                continue
+            for j, other in enumerate(blocks[i + 1 :], start=i + 1):
+                if other.hash in to_remove:
+                    continue
+                sim = self._calculate_code_similarity(block.content, other.content)
+                if sim >= self.valves.code_similarity_threshold:
+                    age_diff = abs(block.timestamp - other.timestamp) / 3600
+                    if age_diff > self.valves.max_duplicate_age_hours:
+                        if (
+                            block.timestamp < other.timestamp
+                            and block.importance_score < 5.0
+                        ):
+                            to_remove.add(block.hash)
+                        elif (
+                            other.timestamp < block.timestamp
+                            and other.importance_score < 5.0
+                        ):
+                            to_remove.add(other.hash)
+                        continue
+                    if block.importance_score >= other.importance_score:
+                        to_remove.add(other.hash)
+                    else:
+                        to_remove.add(block.hash)
+        if to_remove:
+            for h in to_remove:
+                if h in state["active_blocks"]:
+                    self._log_debug(
+                        f"Auto-removed duplicate block {h} (importance: {state['active_blocks'][h].importance_score:.1f})"
+                    )
+                    del state["active_blocks"][h]
+            state["recent_changes"] = [
+                b for b in state["recent_changes"] if b.hash not in to_remove
+            ]
+            state["committed_changes"] = [
+                b for b in state["committed_changes"] if b.hash not in to_remove
+            ]
+
+    # --------------------------------------------------------------------------
+    # LTM retrieval (for smart context selection)
+    # --------------------------------------------------------------------------
+    async def _retrieve_historical_messages(
+        self, query: str, project_id: str, limit: int
+    ) -> List[Dict]:
+        if not HAS_SENTENCE or not HAS_CHROMA or self.memory_collection is None:
+            return []
         try:
-            results = self.memory_collection.get(where={"project_id": project_id})
+            q_emb = self.embedder.encode(query[:1000]).tolist()
+            where_filter = {
+                "project_id": project_id,
+                "is_hierarchical_summary": {"$ne": True},
+            }
+            if self.valves.long_term_memory_expiration_days > 0:
+                where_filter["expires_at"] = {"$gt": datetime.utcnow().isoformat()}
+            results = self.memory_collection.query(
+                query_embeddings=[q_emb],
+                n_results=limit,
+                where=where_filter,
+                include=["documents", "metadatas", "distances"],
+            )
+            messages = []
+            if results and results["documents"]:
+                for i, doc in enumerate(results["documents"][0]):
+                    meta = results["metadatas"][0][i]
+                    role = meta.get("role", "user")
+                    messages.append({"role": role, "content": doc})
+
+            summary_filter = {"project_id": project_id, "is_hierarchical_summary": True}
+            summary_results = self.memory_collection.query(
+                query_embeddings=[q_emb],
+                n_results=limit // 2,
+                where=summary_filter,
+                include=["documents", "metadatas"],
+            )
+            if summary_results and summary_results["documents"]:
+                for i, doc in enumerate(summary_results["documents"][0]):
+                    meta = summary_results["metadatas"][0][i]
+                    role = meta.get("role", "assistant")
+                    messages.append({"role": role, "content": doc})
+
             if (
-                not results
-                or len(results["ids"]) < self.valves.ltm_compress_after_messages
+                self.valves.enable_reranking
+                and self._cross_encoder
+                and len(messages) > 1
             ):
-                return
-            ids = results["ids"]
-            docs = results["documents"]
-            metadatas = results["metadatas"]
-            pairs = sorted(
-                zip(ids, docs, metadatas), key=lambda x: x[2].get("timestamp", "")
-            )
-            to_compress = pairs[: max(len(pairs) // 3, 5)]
-            if len(to_compress) < 2:
-                return
-            texts = "\n---\n".join([doc for _, doc, _ in to_compress])
-            prompt = f"Summarise the following conversation segment, keeping key technical decisions and code changes:\n\n{texts[:3000]}"
-            summary = await self._call_llm(
-                prompt=prompt,
-                system_prompt="You produce concise, information-dense summaries.",
-                max_tokens=500,
-                temperature=0.3,
-            )
-            if summary:
-                self.memory_collection.delete(ids=[id for id, _, _ in to_compress])
-                summary_id = f"{project_id}_summary_{int(time.time())}"
-                summary_embedding = self.embedder.encode(summary).tolist()
-                self.memory_collection.upsert(
-                    ids=[summary_id],
-                    embeddings=[summary_embedding],
-                    metadatas=[
-                        {
-                            "project_id": project_id,
-                            "is_summary": True,
-                            "timestamp": datetime.utcnow().isoformat(),
-                        }
-                    ],
-                    documents=[summary],
-                )
-                self._log_debug(
-                    f"Compressed {len(to_compress)} messages into summary for {project_id}"
-                )
+                docs = [m["content"] for m in messages]
+                reranked = await self._rerank_results(query, docs, limit)
+                doc_to_msg = {m["content"]: m for m in messages}
+                messages = [doc_to_msg[doc] for doc in reranked if doc in doc_to_msg]
+
+            return messages[:limit]
         except Exception as e:
-            logger.warning(f"LTM compression failed: {e}")
+            logger.warning(f"Historical message retrieval failed: {e}")
+            return []
 
     async def _retrieve_relevant_memories(
         self,
@@ -1877,7 +1757,410 @@ Output only JSON.
         return messages, False
 
     # --------------------------------------------------------------------------
-    # Inlet
+    # Active code tracking (main)
+    # --------------------------------------------------------------------------
+    def _update_active_code(self, message: dict, project_id: str):
+        if not self.valves.enable_code_awareness:
+            return
+        state = self._get_state(project_id)
+        # Remove duplicate blocks periodically
+        if self.valves.auto_remove_duplicate_blocks:
+            self._remove_duplicate_blocks(state)
+
+        asyncio.create_task(self._summarize_inactive_blocks_safely(project_id))
+        content = message.get("content", "")
+        role = message.get("role", "")
+
+        self._update_mentions_from_message(state, content)
+
+        for block in state["active_blocks"].values():
+            if (
+                block.content
+                and self._calculate_code_similarity(block.content[:200], content[:200])
+                > 0.7
+            ):
+                block.mention_count += 1
+                block.last_mentioned = time.time()
+                block._update_importance()
+
+        # Run async extract in a new event loop (simplified)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        extracted = loop.run_until_complete(self._extract_code_blocks(content))
+        loop.close()
+        if not content and not extracted:
+            return
+
+        content_type = self._classify_content(content, extracted)
+        file_path, line_start, line_end = self._extract_line_range(content)
+
+        for block_info in extracted:
+            blk_file = file_path or (
+                self._extract_file_paths(content)[0]
+                if self.valves.track_file_paths
+                else None
+            )
+            new_block = CodeBlock(
+                content=block_info["code"],
+                content_type=content_type,
+                generated_by_assistant=(role == "assistant"),
+                file_path=blk_file,
+                line_range=(line_start, line_end) if line_start and line_end else None,
+                timestamp=time.time(),
+                is_active=True,
+                mention_count=1,
+                dependencies=[],
+                potentially_affected=False,
+            )
+
+            if "[KEEP]" in content or "#important" in content.lower():
+                new_block.importance_score = 10.0
+                self._log_debug(
+                    f"Manual importance marker detected for block {new_block.hash}"
+                )
+
+            is_dup, existing = self._is_duplicate_code(
+                new_block, list(state["active_blocks"].values())
+            )
+            if is_dup and existing:
+                if self.valves.prioritize_recent_code:
+                    existing.content = new_block.content
+                    existing.hash = new_block.hash
+                    if new_block.file_path:
+                        existing.file_path = new_block.file_path
+                    existing.line_range = new_block.line_range
+                    existing.timestamp = time.time()
+                    existing.mention_count += 1
+                    existing.last_mentioned = time.time()
+                    existing._update_importance()
+                    self._log_debug(f"Updated existing block {existing.hash}")
+                    if (
+                        self.valves.enable_dependency_tracking
+                        and self.valves.dependency_refresh_on_update
+                    ):
+                        asyncio.create_task(
+                            self._refresh_dependencies_for_block(
+                                existing.hash, project_id
+                            )
+                        )
+                continue
+
+            if (
+                content_type == ContentType.PROPOSED_CHANGE
+                and self._has_conflicting_proposed_changes(state, new_block)
+            ):
+                new_block.importance_score = max(new_block.importance_score, 7.0)
+                self._log_debug(
+                    f"Proposed change {new_block.hash} marked as conflicting"
+                )
+
+            state["active_blocks"][new_block.hash] = new_block
+            self._log_debug(f"New {content_type.value} block: {new_block.hash}")
+
+            if content_type == ContentType.PROPOSED_CHANGE:
+                state["recent_changes"].append(new_block)
+                conflict = self._has_conflicting_proposed_changes(state, new_block)
+                if self.valves.enable_diff_application and not conflict:
+                    for base in list(state["active_blocks"].values()):
+                        if (
+                            base.content_type == ContentType.BASE_CODE
+                            and base.file_path == new_block.file_path
+                        ):
+                            if self._apply_change_with_diff(base, new_block):
+                                state["recent_changes"] = [
+                                    c
+                                    for c in state["recent_changes"]
+                                    if c.hash != new_block.hash
+                                ]
+                                state["committed_changes"].append(new_block)
+                                break
+                else:
+                    self._log_debug(
+                        f"Skipped auto-apply for conflicting proposed change {new_block.hash}"
+                    )
+            elif content_type == ContentType.COMMITTED_CHANGE:
+                state["committed_changes"].append(new_block)
+            elif (
+                content_type == ContentType.ERROR and self.valves.preserve_error_context
+            ):
+                new_block.importance_score = min(new_block.importance_score + 3.0, 10.0)
+
+            if len(state["recent_changes"]) > self.valves.max_proposed_changes:
+                state["recent_changes"] = sorted(
+                    state["recent_changes"],
+                    key=lambda b: b.importance_score,
+                    reverse=True,
+                )[: self.valves.max_proposed_changes]
+            if len(state["committed_changes"]) > self.valves.max_committed_changes:
+                state["committed_changes"] = sorted(
+                    state["committed_changes"],
+                    key=lambda b: b.importance_score,
+                    reverse=True,
+                )[: self.valves.max_committed_changes]
+            if len(state["active_blocks"]) > self.valves.max_active_blocks:
+                sorted_blocks = sorted(
+                    state["active_blocks"].values(),
+                    key=lambda b: b.importance_score,
+                    reverse=True,
+                )
+                keep = sorted_blocks[: self.valves.max_active_blocks]
+                state["active_blocks"] = {b.hash: b for b in keep}
+
+            if self.valves.enable_dependency_tracking and content_type in (
+                ContentType.BASE_CODE,
+                ContentType.PROPOSED_CHANGE,
+                ContentType.COMMITTED_CHANGE,
+            ):
+                asyncio.create_task(
+                    self._refresh_dependencies_for_block(new_block.hash, project_id)
+                )
+
+        # Assistant learning: update best matching base block
+        if role == "assistant" and len(extracted) > 0:
+            for block_info in extracted:
+                best_base = None
+                best_sim = 0.0
+                for base in state["active_blocks"].values():
+                    if base.content_type == ContentType.BASE_CODE:
+                        if base.file_path and file_path and base.file_path == file_path:
+                            sim = self._calculate_code_similarity(
+                                base.content, block_info["code"]
+                            )
+                            if sim > best_sim:
+                                best_sim = sim
+                                best_base = base
+                        else:
+                            sim = self._calculate_code_similarity(
+                                base.content, block_info["code"]
+                            )
+                            if sim > best_sim and sim > 0.6:
+                                best_sim = sim
+                                best_base = base
+                if best_base and best_sim > 0.6 and best_sim < 0.95:
+                    best_base.content = block_info["code"]
+                    best_base.hash = hashlib.md5(
+                        block_info["code"].encode()
+                    ).hexdigest()[:16]
+                    best_base.timestamp = time.time()
+                    best_base.is_active = True
+                    best_base.potentially_affected = False
+                    best_base.importance_score = min(
+                        best_base.importance_score + 1.0, 10.0
+                    )
+                    self._log_debug(
+                        f"Assistant updated base code block {best_base.hash} (sim={best_sim:.2f})"
+                    )
+                    if (
+                        self.valves.enable_dependency_tracking
+                        and self.valves.dependency_refresh_on_update
+                    ):
+                        asyncio.create_task(
+                            self._refresh_dependencies_for_block(
+                                best_base.hash, project_id
+                            )
+                        )
+
+        state["message_count"] += 1
+
+        # Remove duplicates again after modifications
+        if self.valves.auto_remove_duplicate_blocks:
+            self._remove_duplicate_blocks(state)
+
+        if self.valves.hierarchical_compression_enabled:
+            if (
+                state["message_count"]
+                % self.valves.hierarchical_compression_interval_messages
+                == 0
+            ):
+                asyncio.create_task(self._hierarchical_compress(project_id, state))
+
+        asyncio.create_task(self._expire_blocks_by_time(project_id))
+        asyncio.create_task(self._clean_affected_flags(project_id))
+        self._set_state(project_id, state)
+
+    def _is_duplicate_code(
+        self, new_block: CodeBlock, existing_blocks: List[CodeBlock]
+    ) -> Tuple[bool, Optional[CodeBlock]]:
+        for ex in existing_blocks:
+            sim = self._calculate_code_similarity(new_block.content, ex.content)
+            if sim >= self.valves.code_similarity_threshold:
+                return True, ex
+        return False, None
+
+    def _get_active_code_context(self, project_id: str) -> str:
+        state = self._get_state(project_id)
+        if not state or not state["active_blocks"]:
+            return ""
+        now = time.time()
+        active = []
+        for block in state["active_blocks"].values():
+            if not block.is_active and self.valves.track_active_code_age:
+                if now - block.timestamp > self.valves.active_code_timeout_minutes * 60:
+                    continue
+            active.append(block)
+        if not active:
+            return ""
+        active.sort(key=lambda b: b.importance_score, reverse=True)
+        base_codes = [b for b in active if b.content_type == ContentType.BASE_CODE][
+            : self.valves.max_base_code_blocks
+        ]
+        proposed = [b for b in active if b.content_type == ContentType.PROPOSED_CHANGE][
+            : self.valves.max_proposed_changes
+        ]
+        committed = [
+            b for b in active if b.content_type == ContentType.COMMITTED_CHANGE
+        ][: self.valves.max_committed_changes]
+        errors = (
+            [b for b in active if b.content_type == ContentType.ERROR][:3]
+            if self.valves.preserve_error_context
+            else []
+        )
+
+        parts = ["## Currently Active Code Context (by importance)\n"]
+        if base_codes:
+            parts.append("### Base Code (current work):")
+            for b in base_codes:
+                loc = (
+                    f" (file: {b.file_path}"
+                    + (
+                        f", lines {b.line_range[0]}-{b.line_range[1]}"
+                        if b.line_range
+                        else ""
+                    )
+                    + ")"
+                    if b.file_path
+                    else ""
+                )
+                aff = (
+                    " [AFFECTED BY DEPENDENCY CHANGE]" if b.potentially_affected else ""
+                )
+                parts.append(
+                    f"```\n{b.content[:600]}\n```{loc}  (importance: {b.importance_score:.1f}){aff}"
+                )
+        if proposed:
+            parts.append("### Proposed Changes (pending review):")
+            for b in proposed:
+                parts.append(f"```diff\n{b.content[:500]}\n```")
+        if committed:
+            parts.append("### Recently Committed Changes:")
+            for b in committed:
+                parts.append(f"```\n{b.content[:300]}\n```")
+        if errors:
+            parts.append("### Recent Errors:")
+            for b in errors:
+                parts.append(f"```\n{b.content[:500]}\n```")
+        return "\n".join(parts)
+
+    # --------------------------------------------------------------------------
+    # Token estimation for messages
+    # --------------------------------------------------------------------------
+    def _estimate_tokens(self, messages: List[dict]) -> int:
+        if self.tokenizer:
+            total = 0
+            for m in messages:
+                content = str(m.get("content", ""))
+                total += len(self.tokenizer.encode(content))
+                total += 4
+            return total
+        total_chars = sum(len(str(m.get("content", ""))) for m in messages)
+        total_chars += sum(30 for _ in messages)
+        return total_chars // 4
+
+    # --------------------------------------------------------------------------
+    # LTM storage
+    # --------------------------------------------------------------------------
+    def _store_message_in_memory(self, message: dict, project_id: str):
+        if not HAS_SENTENCE or not HAS_CHROMA or self.memory_collection is None:
+            return
+        content = message.get("content", "")
+        if not content or len(content.strip()) < 15:
+            return
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        extracted = loop.run_until_complete(self._extract_code_blocks(content))
+        loop.close()
+        content_type = self._classify_content(content, extracted)
+        msg_id = f"{project_id}_{int(time.time())}_{hashlib.md5(content.encode()).hexdigest()[:8]}"
+        expires_at = None
+        if self.valves.long_term_memory_expiration_days > 0:
+            expires_at = (
+                datetime.utcnow()
+                + timedelta(days=self.valves.long_term_memory_expiration_days)
+            ).isoformat()
+        embedding = self.embedder.encode(content).tolist()
+        self.memory_collection.upsert(
+            ids=[msg_id],
+            embeddings=[embedding],
+            metadatas=[
+                {
+                    "role": message.get("role"),
+                    "project_id": project_id,
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "expires_at": expires_at,
+                    "content_type": content_type.value,
+                    "has_code": len(extracted) > 0,
+                }
+            ],
+            documents=[content],
+        )
+        self._log_debug(f"Stored message {msg_id} in LTM")
+
+        state = self._get_state(project_id)
+        msg_count = state.get("message_count", 0)
+        if msg_count > 0 and msg_count % self.valves.ltm_compress_after_messages == 0:
+            asyncio.create_task(self._compress_ltm_for_conversation(project_id))
+
+    async def _compress_ltm_for_conversation(self, project_id: str):
+        if not HAS_AIOHTTP or not self.memory_collection:
+            return
+        try:
+            results = self.memory_collection.get(where={"project_id": project_id})
+            if (
+                not results
+                or len(results["ids"]) < self.valves.ltm_compress_after_messages
+            ):
+                return
+            ids = results["ids"]
+            docs = results["documents"]
+            metadatas = results["metadatas"]
+            pairs = sorted(
+                zip(ids, docs, metadatas), key=lambda x: x[2].get("timestamp", "")
+            )
+            to_compress = pairs[: max(len(pairs) // 3, 5)]
+            if len(to_compress) < 2:
+                return
+            texts = "\n---\n".join([doc for _, doc, _ in to_compress])
+            prompt = f"Summarise the following conversation segment, keeping key technical decisions and code changes:\n\n{texts[:3000]}"
+            summary = await self._call_llm(
+                prompt=prompt,
+                system_prompt="You produce concise, information-dense summaries.",
+                max_tokens=500,
+                temperature=0.3,
+            )
+            if summary:
+                self.memory_collection.delete(ids=[id for id, _, _ in to_compress])
+                summary_id = f"{project_id}_summary_{int(time.time())}"
+                summary_embedding = self.embedder.encode(summary).tolist()
+                self.memory_collection.upsert(
+                    ids=[summary_id],
+                    embeddings=[summary_embedding],
+                    metadatas=[
+                        {
+                            "project_id": project_id,
+                            "is_summary": True,
+                            "timestamp": datetime.utcnow().isoformat(),
+                        }
+                    ],
+                    documents=[summary],
+                )
+                self._log_debug(
+                    f"Compressed {len(to_compress)} messages into summary for {project_id}"
+                )
+        except Exception as e:
+            logger.warning(f"LTM compression failed: {e}")
+
+    # --------------------------------------------------------------------------
+    # Inlet (main entry point)
     # --------------------------------------------------------------------------
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("inlet called")
@@ -1889,6 +2172,7 @@ Output only JSON.
 
         state = self._get_state(project_id)
 
+        # Handle forget commands
         if (
             self.valves.enable_forget_command
             or self.valves.enable_natural_language_forget
@@ -1900,6 +2184,39 @@ Output only JSON.
                 body["messages"] = new_messages
                 return body
 
+        # Smart context selection
+        if self.valves.smart_context_selection and len(messages) > 0:
+            last_user_idx = -1
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get("role") == "user":
+                    last_user_idx = i
+                    break
+            if last_user_idx != -1:
+                query = messages[last_user_idx].get("content", "")
+                if query:
+                    top_k = self.valves.smart_context_top_k
+                    historical = await self._retrieve_historical_messages(
+                        query, project_id, top_k
+                    )
+                    new_history = []
+                    if self.valves.smart_context_include_last_user:
+                        new_history.append(messages[last_user_idx])
+                        if (
+                            last_user_idx + 1 < len(messages)
+                            and messages[last_user_idx + 1].get("role") == "assistant"
+                        ):
+                            new_history.append(messages[last_user_idx + 1])
+                    for msg in historical:
+                        if msg["content"] != query:
+                            new_history.append(msg)
+                    system_msgs = [m for m in messages if m.get("role") == "system"]
+                    messages = system_msgs + new_history
+                    body["messages"] = messages
+                    self._log_debug(
+                        f"Smart context selection replaced history with {len(new_history)} messages (retrieved {len(historical)} from LTM)"
+                    )
+
+        # Handle feedback intents
         if self.valves.enable_feedback_tracking:
             last_user_msg = (
                 messages[-1]
@@ -1917,15 +2234,18 @@ Output only JSON.
                         feedback_intent.get("comment", ""),
                     )
 
+        # Update active code from recent messages
         if self.valves.enable_code_awareness:
             for msg in messages[-5:]:
                 self._update_active_code(msg, project_id)
 
+        # Only retrieve LTM for base code/error if smart context is disabled
         last_user_msg = next(
             (m for m in reversed(messages) if m.get("role") == "user"), None
         )
         if (
-            last_user_msg
+            not self.valves.smart_context_selection
+            and last_user_msg
             and HAS_SENTENCE
             and HAS_CHROMA
             and self.valves.enable_code_awareness
@@ -1954,6 +2274,7 @@ Output only JSON.
                     messages.insert(0, {"role": "system", "content": ctx})
                 body["messages"] = messages
 
+        # Inject active code context
         if self.valves.enable_code_awareness:
             active_ctx = self._get_active_code_context(project_id)
             if active_ctx:
@@ -1966,6 +2287,7 @@ Output only JSON.
                     messages.insert(0, {"role": "system", "content": active_ctx})
                 body["messages"] = messages
 
+        # Inject feedback context
         if self.valves.enable_feedback_tracking and self.valves.inject_feedback_context:
             feedback_ctx = self._get_feedback_context(project_id)
             if feedback_ctx:
@@ -1978,6 +2300,7 @@ Output only JSON.
                     messages.insert(0, {"role": "system", "content": feedback_ctx})
                 body["messages"] = messages
 
+        # Adaptive trim (fallback)
         system_msgs = [m for m in messages if m.get("role") == "system"]
         history_msgs = [m for m in messages if m.get("role") != "system"]
         trim_needed = False
