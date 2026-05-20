@@ -1,10 +1,10 @@
 """
-title: Code-Aware Context Manager with LTM & Summarization (v5.13)
-description: Full-featured context manager for coding assistants. Persists state, tracks line ranges, applies diffs, compresses LTM, scores importance, learns from assistant responses, summarizes inactive code, supports manual importance markers, robust LLM fallback, natural language forget commands, feedback tracking, hierarchical project-based memory, LRU cache, optional reranking, semantic dependency tracking, automatic handling of oversized code blocks, smart context selection, hierarchical conversation compression, automatic duplicate removal, and frequency-based prioritization.
+title: Code-Aware Context Manager with LTM & Summarization (v5.15)
+description: Full-featured context manager for coding assistants. Persists state, tracks line ranges, applies diffs, compresses LTM, scores importance, learns from assistant responses, summarizes inactive code, supports manual importance markers, robust LLM fallback, natural language forget commands, feedback tracking, hierarchical project-based memory, LRU cache, optional reranking, semantic dependency tracking, automatic handling of oversized code blocks, smart context selection, hierarchical conversation compression, automatic duplicate removal, frequency-based prioritization, and content-aware selective summarization.
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.13.0
+version: 5.15.0
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz
 """
@@ -14,7 +14,7 @@ import time
 import re
 import hashlib
 import sqlite3
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 import json
 import asyncio
 import difflib
@@ -238,6 +238,42 @@ class Filter:
         )
         frequency_decay_hours: float = Field(
             default=12.0, description="Half-life for frequency boost."
+        )
+
+        # Selective summarization by content type
+        selective_summarization: bool = Field(
+            default=True,
+            description="Apply different summarization strategies based on content type.",
+        )
+        error_preserve_verbatim: bool = Field(
+            default=True, description="Never summarize error messages; keep them as-is."
+        )
+        error_max_age_hours: float = Field(
+            default=48.0,
+            description="Maximum age after which errors may be summarized (if error_preserve_verbatim is False).",
+        )
+        code_summary_level: str = Field(
+            default="balanced",
+            description="Summarization detail for code blocks: 'minimal' (signature only), 'balanced' (signature + key logic), 'detailed' (full structure).",
+        )
+        general_summary_max_tokens: int = Field(
+            default=200,
+            description="Maximum tokens for summarizing general conversation.",
+        )
+        tool_call_preserve: bool = Field(
+            default=True, description="Preserve tool call chains without summarization."
+        )
+        code_always_keep_signature: bool = Field(
+            default=True,
+            description="Always extract and keep function/class signatures even when summarizing code.",
+        )
+        summary_fallback_model: str = Field(
+            default="",
+            description="Model to use for selective summarization (if empty, uses default summarization_model).",
+        )
+        summary_include_metadata: bool = Field(
+            default=True,
+            description="Include metadata (content type, timestamp range) in summaries.",
         )
 
         summarize_old_messages: bool = Field(
@@ -883,6 +919,42 @@ Example output: ["os", "Path", "utils.py", "calculate_total"]
                 ):
                     return ContentType.BASE_CODE
         return ContentType.GENERAL
+
+    # --------------------------------------------------------------------------
+    # Helper: content-type-aware summarization prompt
+    # --------------------------------------------------------------------------
+    def _get_summary_prompt_for_content(
+        self, content_type: ContentType, text: str, max_tokens: int
+    ) -> str:
+        """Return a specialized summarization prompt based on content type."""
+        if not self.valves.selective_summarization:
+            return f"Summarise the following conversation. Keep key decisions, actions, and important context. Be concise.\n\n{text}"
+
+        if content_type == ContentType.ERROR:
+            if self.valves.error_preserve_verbatim:
+                return text  # no summarization
+            else:
+                return f"Summarise the following error message, keeping the error type, location, and root cause. Do not omit technical details.\n\n{text}"
+        elif content_type in (
+            ContentType.BASE_CODE,
+            ContentType.PROPOSED_CHANGE,
+            ContentType.COMMITTED_CHANGE,
+        ):
+            level = self.valves.code_summary_level
+            if level == "minimal":
+                instruction = "Extract only the function/class signatures and the overall purpose. Do not include implementation details."
+            elif level == "detailed":
+                instruction = "Summarise the code, keeping key functions, classes, important logic, and any comments. Aim for a medium level of detail."
+            else:  # balanced
+                instruction = "Summarise the code, focusing on what it does, its main functions/classes, and any non-trivial logic."
+            return f"{instruction}\n\n```\n{text[:3000]}\n```"
+        elif content_type == ContentType.TOOL_CALL:
+            if self.valves.tool_call_preserve:
+                return text
+            else:
+                return f"Summarise the following tool call sequence, keeping the tool names and main parameters.\n\n{text}"
+        else:  # GENERAL
+            return f"Summarise the following conversation, keeping key decisions, action items, and unresolved issues. Be concise (target {max_tokens} tokens).\n\n{text}"
 
     # --------------------------------------------------------------------------
     # LLM helper
@@ -1573,26 +1645,67 @@ Output only JSON.
         return "\n".join(lines)
 
     # --------------------------------------------------------------------------
-    # Summarization helper for messages
+    # Selective summarization for messages (overwrites previous method)
     # --------------------------------------------------------------------------
     async def _summarize_messages(
         self, messages: List[dict], is_code_context: bool = False
     ) -> Optional[str]:
         if not HAS_AIOHTTP or not messages:
             return None
+
+        # Determine predominant content type in the message block
+        content_type_counts = defaultdict(int)
+        for m in messages:
+            content = m.get("content", "")
+            extracted = await self._extract_code_blocks(content)
+            ctype = self._classify_content(content, extracted)
+            content_type_counts[ctype] += 1
+
+        # If errors present and preserve_verbatim, return original text (no summarization)
+        if (
+            self.valves.selective_summarization
+            and self.valves.error_preserve_verbatim
+            and content_type_counts.get(ContentType.ERROR, 0) > 0
+        ):
+            # Keep error messages as-is
+            return "\n".join(
+                [f"{m.get('role')}: {m.get('content', '')}" for m in messages]
+            )
+
+        # Build conversation text and get appropriate prompt
         conv_text = "\n".join(
             f"{m.get('role')}: {m.get('content', '')}" for m in messages
         )
-        if is_code_context:
-            prompt = f"Summarise technical conversation. Keep code, decisions, actions, and unresolved issues.\n\n{conv_text}"
+        # Determine dominant type for prompt (or default to GENERAL)
+        if content_type_counts:
+            dominant_type = max(content_type_counts.items(), key=lambda x: x[1])[0]
         else:
-            prompt = f"Summarise conversation, keep key points.\n\n{conv_text}"
-        return await self._call_llm(
+            dominant_type = ContentType.GENERAL
+        prompt = self._get_summary_prompt_for_content(
+            dominant_type, conv_text, self.valves.general_summary_max_tokens
+        )
+        model_override = (
+            self.valves.summary_fallback_model
+            if self.valves.summary_fallback_model
+            else None
+        )
+        max_tokens = (
+            self.valves.general_summary_max_tokens
+            if dominant_type == ContentType.GENERAL
+            else 500
+        )
+        summary = await self._call_llm(
             prompt=prompt,
-            system_prompt="You are a code-aware assistant.",
-            max_tokens=500,
+            system_prompt="You are a code-aware assistant that produces concise, information-dense summaries.",
+            model_override=model_override,
+            max_tokens=max_tokens,
             temperature=0.3,
         )
+        if not summary:
+            return None
+        if self.valves.selective_summarization and self.valves.summary_include_metadata:
+            summary = f"[Summary of {len(messages)} messages, type: {dominant_type.value}]\n{summary}"
+        return summary
 
     # --------------------------------------------------------------------------
     # Forget command handling
