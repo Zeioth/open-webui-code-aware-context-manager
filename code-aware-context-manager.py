@@ -1,10 +1,10 @@
 """
-title: Gestor de Contexto para Código con Memoria LTM y Resúmenes (v5.22)
-description: Gestor completo de contexto para asistentes de código. Persiste estado por proyecto, detecta rangos de líneas, aplica diffs, comprime LTM, puntúa importancia, aprende de respuestas, resume código inactivo, admite marcadores manuales, comandos en lenguaje natural para olvidar/recordar, seguimiento de retroalimentación, memoria jerárquica, caché LRU, reranking opcional, detección de dependencias, manejo de bloques enormes, selección inteligente de contexto, compresión jerárquica, eliminación de duplicados, priorización por frecuencia, resúmenes selectivos, comandos para iterar, desduplicación de mensajes similares, detección de contradicciones, razonamiento paso a paso, extracción de supuestos, marcado de obsoleto, sugerencias proactivas, detección de preguntas repetidas y sugerencias de comandos por contexto.
+title: Code-Aware Context Manager with LTM & Summarization (v5.23)
+description: Full-featured context manager for coding assistants. Persists state per project, tracks line ranges, applies diffs, compresses LTM, scores importance, learns from responses, summarizes inactive code, supports manual markers, natural language forget/remember commands, feedback tracking, hierarchical memory, LRU cache, optional reranking, dependency detection (AST for Python), handling of oversized blocks, smart context selection, hierarchical compression, duplicate removal, frequency prioritization, selective summarization, iterative commands, consecutive message deduplication, contradiction detection, chain-of-thought reasoning, assumption extraction, obsolete marking, proactive suggestions, duplicate question detection, command suggestions, and semantic response caching.
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.22.0
+version: 5.23.0
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz
 """
@@ -14,6 +14,7 @@ import time
 import re
 import hashlib
 import sqlite3
+import ast
 from collections import OrderedDict, defaultdict
 import json
 import asyncio
@@ -24,7 +25,7 @@ from enum import Enum
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
-# Dependencias opcionales
+# Optional dependencies
 # ---------------------------------------------------------------------------
 try:
     import tiktoken
@@ -98,6 +99,8 @@ class CodeBlock(BaseModel):
     pinned: bool = False
     affected_timestamp: float = 0.0
     obsolete: bool = False
+    ast_imports: List[str] = Field(default_factory=list)
+    ast_calls: List[str] = Field(default_factory=list)
 
     def __init__(self, **data):
         super().__init__(**data)
@@ -150,472 +153,450 @@ class AppliedChangeFeedback(BaseModel):
 
 class Filter:
     class Valves(BaseModel):
-        priority: int = Field(default=0, description="Nivel de prioridad del filtro.")
+        priority: int = Field(default=0, description="Filter priority level.")
         max_turns: int = Field(
-            default=20, description="Máximo de mensajes no‑sistema a conservar."
+            default=20, description="Max non-system messages to keep."
         )
-        debug: bool = Field(
-            default=False, description="Activa logs detallados de depuración."
-        )
+        debug: bool = Field(default=False, description="Enable verbose debug logging.")
         state_db_path: str = Field(
             default="/app/backend/data/conversation_state.db",
-            description="Ruta a la base de datos SQLite.",
+            description="SQLite DB path.",
         )
         track_line_numbers: bool = Field(
-            default=True, description="Extraer rangos de línea de los archivos."
+            default=True, description="Extract line ranges from files."
         )
         adaptive_trim: bool = Field(
-            default=True, description="Recortar solo cuando se excedan los tokens."
+            default=True, description="Trim only when exceeding tokens."
         )
         context_window_tokens: int = Field(
-            default=8192, description="Tamaño de la ventana de contexto del modelo."
+            default=8192, description="Context window size."
         )
         use_tiktoken: bool = Field(
-            default=True,
-            description="Usar tiktoken para contar tokens (si está disponible).",
+            default=True, description="Use tiktoken for token counting."
         )
 
         long_term_memory_dir: str = Field(
             default="/app/backend/data/long_term_memory",
-            description="Directorio para ChromaDB.",
+            description="ChromaDB directory.",
         )
         long_term_memory_expiration_days: int = Field(
-            default=30, description="Días hasta que caduca una entrada de LTM."
+            default=30, description="Days until LTM entry expires."
         )
         long_term_memory_top_k: int = Field(
-            default=10, description="Cantidad de resultados a recuperar de LTM."
+            default=10, description="Number of results to retrieve from LTM."
         )
         long_term_memory_similarity_threshold: float = Field(
-            default=0.65, description="Umbral mínimo de similitud coseno."
+            default=0.65, description="Minimum cosine similarity threshold."
         )
         ltm_time_decay_hours: float = Field(
-            default=24.0, description="Decaimiento temporal para la recuperación LTM."
+            default=24.0, description="Time decay for LTM retrieval."
         )
         enable_reranking: bool = Field(
-            default=False,
-            description="Usar reranking con cross‑encoder para resultados LTM.",
+            default=False, description="Use cross-encoder reranking for LTM results."
         )
         reranker_model: str = Field(
             default="cross-encoder/ms-marco-MiniLM-L-6-v2",
-            description="Modelo cross‑encoder para reranking.",
+            description="Cross-encoder model.",
         )
         reranker_top_k: int = Field(
-            default=5, description="Número de resultados después del reranking."
+            default=5, description="Number of results after reranking."
         )
 
-        # Selección inteligente de contexto
+        # Smart context selection
         smart_context_selection: bool = Field(
             default=False,
-            description="Reemplazar la ventana deslizante por recuperación semántica del historial.",
+            description="Replace sliding window with semantic retrieval from conversation history.",
         )
         smart_context_top_k: int = Field(
-            default=15, description="Número de mensajes pasados a recuperar."
+            default=15, description="Number of past messages to retrieve."
         )
         smart_context_min_tokens: int = Field(
-            default=1024, description="Tokens mínimos a intentar recuperar."
+            default=1024, description="Minimum tokens to aim for."
         )
         smart_context_include_last_user: bool = Field(
-            default=True, description="Incluir siempre el último mensaje del usuario."
+            default=True, description="Always include the most recent user message."
         )
 
-        # Compresión jerárquica
+        # Hierarchical compression
         hierarchical_compression_enabled: bool = Field(
             default=False,
-            description="Comprimir periódicamente segmentos viejos de conversación.",
+            description="Periodically compress old conversation segments.",
         )
         hierarchical_compression_interval_messages: int = Field(
             default=100,
-            description="Número de mensajes tras el cual se activa la compresión.",
+            description="Number of messages after which to trigger compression.",
         )
         hierarchical_summary_model: str = Field(
-            default="", description="Modelo para resúmenes jerárquicos."
+            default="", description="Model for hierarchical summaries."
         )
         hierarchical_summary_max_tokens: int = Field(
-            default=800, description="Máximo de tokens para el resumen jerárquico."
+            default=800, description="Max tokens for hierarchical summary."
         )
 
-        # Eliminación de duplicados y priorización por frecuencia
+        # Duplicate removal and frequency prioritization
         auto_remove_duplicate_blocks: bool = Field(
-            default=True,
-            description="Eliminar automáticamente bloques de código duplicados más antiguos.",
+            default=True, description="Auto-remove older duplicate code blocks."
         )
         max_duplicate_age_hours: float = Field(
-            default=6.0,
-            description="Diferencia máxima de edad para considerar duplicados.",
+            default=6.0, description="Max age difference for considering duplicates."
         )
         frequency_weight_factor: float = Field(
-            default=0.3,
-            description="Peso de la frecuencia de menciones en la importancia.",
+            default=0.3, description="Weight for mention frequency in importance."
         )
         min_mentions_for_boost: int = Field(
-            default=3,
-            description="Mínimo de menciones para aplicar el bonus de frecuencia.",
+            default=3, description="Min mentions to apply frequency boost."
         )
         frequency_decay_hours: float = Field(
-            default=12.0,
-            description="Vida media para el decaimiento del bonus de frecuencia.",
+            default=12.0, description="Half-life for frequency boost."
         )
 
-        # Características metacognitivas
+        # Metacognitive features
         enable_confidence_scoring: bool = Field(
-            default=True,
-            description="Pedir al asistente que estime su confianza (0-100%).",
+            default=True, description="Ask assistant to estimate confidence (0-100%)."
         )
         confidence_prompt: str = Field(
-            default="\n\nDespués de tu respuesta, en una línea nueva, escribe '[Confianza: XX%]' donde XX es tu confianza estimada (0-100) en la corrección e integridad de tu respuesta, basada en el contexto disponible. Si te falta información, da una confianza baja y sugiere qué contexto ayudaría.",
-            description="Sufijo que se añade al prompt del sistema para pedir confianza.",
+            default="\n\nAfter your response, on a new line, output '[Confidence: XX%]' where XX is your estimated confidence (0-100) in the correctness and completeness of your answer, based on the available context. If you lack information, give lower confidence and suggest what context would help.",
+            description="Suffix added to system prompt to request confidence.",
         )
         proactive_context_warning_threshold: float = Field(
             default=0.85,
-            description="Fracción de la ventana de tokens que activa una advertencia proactiva (0.0-1.0).",
+            description="Token usage ratio that triggers a proactive warning.",
         )
         proactive_context_warning_message: str = Field(
-            default="\n\n⚠️ **Advertencia de contexto**: La conversación está usando más del {percent}% de la ventana de contexto disponible ({used_tokens}/{max_tokens} tokens). Considera usar `/forget` para eliminar partes irrelevantes, `/remember` para fijar contexto importante, o pídeme que resuma partes antiguas.",
-            description="Mensaje de advertencia inyectado cuando el contexto está casi lleno.",
+            default="\n\n⚠️ **Context Warning**: The conversation is using more than {percent}% of the available context window ({used_tokens}/{max_tokens} tokens). Consider using `/forget` to remove irrelevant parts, `/remember` to pin important context, or ask me to summarize older parts.",
+            description="Warning message injected when context is nearly full.",
         )
         enable_facts: bool = Field(
             default=True,
-            description="Permitir hechos explícitos con [FACT: ...] y almacenarlos persistentemente.",
+            description="Allow explicit facts via [FACT: ...] and store them persistently.",
         )
         fact_max_age_days: int = Field(
-            default=90, description="Días hasta que un hecho expira (0 = nunca)."
+            default=90, description="Days after which a fact expires (0 = never)."
         )
         inject_facts_in_context: bool = Field(
-            default=True,
-            description="Inyectar siempre los hechos almacenados en el prompt del sistema.",
+            default=True, description="Always inject stored facts into system prompt."
         )
         fact_importance_boost: float = Field(
-            default=1.5,
-            description="Multiplicador para la puntuación de importancia de los hechos.",
+            default=1.5, description="Multiplier for fact importance score."
         )
         fact_command_prefix: str = Field(
-            default="/fact",
-            description="Prefijo de comando para la gestión de hechos (ej. /fact add, /fact list, /fact remove).",
+            default="/fact", description="Command prefix for fact management."
         )
         enable_auto_fact_detection: bool = Field(
             default=False,
-            description="Detectar automáticamente hechos potenciales a partir de mensajes del usuario (experimental).",
+            description="Automatically detect potential facts from user messages (experimental).",
         )
 
-        # Ejecución iterativa de tareas (/iterate)
+        # Iterative task execution
         enable_iterative_mode: bool = Field(
-            default=True,
-            description="Permitir el comando /iterate para tareas multi‑paso.",
+            default=True, description="Allow /iterate command for multi-step tasks."
         )
         iterative_auto_continue: bool = Field(
             default=False,
-            description="Si es True, /iterate ejecuta todos los pasos sin esperar confirmación del usuario (usar con precaución).",
+            description="If True, /iterate runs all steps without waiting for user confirmation (use with caution).",
         )
         iterative_max_steps: int = Field(
-            default=10,
-            description="Número máximo de pasos por iteración para evitar desbordamiento de contexto.",
+            default=10, description="Maximum number of steps per iteration."
         )
         iterative_diff_format: str = Field(
-            default="unified",
-            description="Formato del diff: 'unified' (por defecto) o 'context'.",
+            default="unified", description="Diff format: 'unified' or 'context'."
         )
         iterative_planning_model: str = Field(
-            default="",
-            description="Modelo para la planificación (si está vacío, usa llm_model o summarization_model).",
+            default="", description="Model for planning (if empty, uses llm_model)."
         )
         iterative_execution_model: str = Field(
             default="",
-            description="Modelo para la ejecución de pasos (si está vacío, usa el mismo que planificación).",
+            description="Model for step execution (if empty, uses same as planning).",
         )
         iterative_resume_command: str = Field(
             default="/iterate resume",
-            description="Comando para reanudar una iteración interrumpida.",
+            description="Command to resume an interrupted iteration.",
         )
         natural_language_iterate: bool = Field(
             default=True,
-            description="Permitir lenguaje natural para iniciar iteraciones (ej. 'implementa todas las características paso a paso').",
+            description="Allow natural language to start iterations (e.g., 'implement all features step by step').",
         )
 
-        # Desduplicación de mensajes similares consecutivos
+        # Consecutive similar message handling
         similar_message_handling: str = Field(
             default="replace",
-            description="Acción para mensajes consecutivos muy similares: 'replace' (conserva el último), 'summarize_diff' (genera resumen de diferencias), 'mark_obsolete' o 'none'.",
+            description="Action for consecutive similar messages: 'replace', 'summarize_diff', 'mark_obsolete', or 'none'.",
         )
         similar_message_threshold: float = Field(
             default=0.85,
-            description="Umbral de similitud (0-1) para considerar mensajes como duplicados.",
+            description="Similarity threshold to consider messages as duplicates.",
         )
         similar_message_check_code_only: bool = Field(
-            default=True,
-            description="Aplicar solo a mensajes que contengan bloques de código.",
+            default=True, description="Only apply to messages containing code blocks."
         )
 
-        # Marcado de obsoleto (/obsolete)
+        # Obsolete marking
         enable_obsolete_marking: bool = Field(
             default=True,
-            description="Permitir marcar bloques de código como obsoletos con /obsolete.",
+            description="Allow marking code blocks as obsolete with /obsolete.",
         )
 
-        # Sugerencias proactivas de resumen (predicción #1)
+        # Proactive summarization suggestion
         proactive_summary_threshold: float = Field(
             default=0.75,
-            description="Uso de tokens que activa una sugerencia de resumen.",
+            description="Token usage that triggers a summarization suggestion.",
         )
         proactive_summary_growth_window: int = Field(
-            default=3,
-            description="Número de mensajes recientes para estimar la tasa de crecimiento de tokens.",
+            default=3, description="Number of recent messages to estimate token growth."
         )
 
-        # Detección de preguntas repetidas (#2)
+        # Duplicate question detection
         duplicate_question_threshold: float = Field(
             default=0.92,
-            description="Umbral de similitud para considerar una pregunta como duplicada.",
+            description="Similarity threshold for considering a question as duplicate.",
         )
         duplicate_question_lookback: int = Field(
-            default=20,
-            description="Número de mensajes de usuario anteriores a revisar.",
+            default=20, description="Number of previous user messages to search."
         )
 
-        # Sugerencias de comandos por contexto (#5)
+        # Context-aware command suggestions
         enable_command_suggestions: bool = Field(
             default=True,
-            description="Inyectar mensajes de sistema con sugerencias de comandos útiles según el estado actual.",
+            description="Inject helpful command suggestions based on current state.",
         )
         command_suggestion_cooldown_minutes: int = Field(
             default=10,
-            description="Minutos que esperar antes de mostrar la misma sugerencia otra vez.",
+            description="Minutes to wait before showing the same suggestion again.",
         )
 
-        # Resúmenes selectivos por tipo de contenido
+        # Response cache (semantic caching)
+        enable_response_cache: bool = Field(
+            default=True,
+            description="Enable semantic caching of assistant responses to avoid repeated LLM calls for similar questions.",
+        )
+        response_cache_similarity_threshold: float = Field(
+            default=0.92,
+            description="Cosine similarity threshold to consider a cached response as a match.",
+        )
+        response_cache_ttl_hours: float = Field(
+            default=24.0,
+            description="Time-to-live for cached entries (0 = never expire).",
+        )
+        response_cache_max_entries: int = Field(
+            default=100,
+            description="Maximum number of cached (question, answer) pairs per project.",
+        )
+        response_cache_include_context_hash: bool = Field(
+            default=True,
+            description="Include context hash in cache key to avoid mismatches.",
+        )
+
+        # Selective summarization
         selective_summarization: bool = Field(
             default=True,
-            description="Aplicar estrategias de resumen distintas según el tipo de contenido.",
+            description="Apply different summarization strategies based on content type.",
         )
         error_preserve_verbatim: bool = Field(
-            default=True,
-            description="Nunca resumir mensajes de error; mantenerlos textualmente.",
+            default=True, description="Never summarize error messages; keep them as-is."
         )
         error_max_age_hours: float = Field(
             default=48.0,
-            description="Edad máxima tras la cual los errores pueden ser resumidos (si error_preserve_verbatim es False).",
+            description="Maximum age after which errors may be summarized (if error_preserve_verbatim is False).",
         )
         code_summary_level: str = Field(
             default="balanced",
-            description="Nivel de detalle para resúmenes de código: 'minimal' (solo firmas), 'balanced' (firmas + lógica clave), 'detailed' (estructura completa).",
+            description="Summarization detail for code: 'minimal', 'balanced', 'detailed'.",
         )
         general_summary_max_tokens: int = Field(
-            default=200,
-            description="Máximo de tokens para resumir conversación general.",
+            default=200, description="Max tokens for summarizing general conversation."
         )
         tool_call_preserve: bool = Field(
-            default=True,
-            description="Preservar cadenas de llamadas a herramientas sin resumir.",
+            default=True, description="Preserve tool call chains without summarization."
         )
         code_always_keep_signature: bool = Field(
             default=True,
-            description="Siempre extraer y conservar firmas de funciones/clases aunque se resuma el código.",
+            description="Always extract function/class signatures even when summarizing code.",
         )
         summary_fallback_model: str = Field(
             default="",
-            description="Modelo a usar para resúmenes selectivos (si está vacío, usa summarization_model).",
+            description="Model for selective summarization (if empty, uses summarization_model).",
         )
         summary_include_metadata: bool = Field(
-            default=True,
-            description="Incluir metadatos (tipo de contenido, rango de tiempo) en los resúmenes.",
+            default=True, description="Include metadata in summaries."
         )
 
         summarize_old_messages: bool = Field(
-            default=True, description="Resumir bloques de mensajes descartados."
+            default=True, description="Summarize discarded message blocks."
         )
         summarization_model: str = Field(
-            default="gpt-3.5-turbo", description="Modelo de resumen por defecto."
+            default="gpt-3.5-turbo", description="Default summarization model."
         )
         openai_api_base: str = Field(
             default=os.getenv("OPENAI_API_BASE", "http://localhost:8080/v1"),
-            description="Base URL de la API compatible con OpenAI.",
+            description="OpenAI-compatible API base URL.",
         )
         openai_api_key: str = Field(
-            default=os.getenv("OPENAI_API_KEY", "dummy"), description="Clave de la API."
+            default=os.getenv("OPENAI_API_KEY", "dummy"), description="API key."
         )
 
         enable_code_awareness: bool = Field(
-            default=True,
-            description="Activar todas las funcionalidades de análisis de código.",
+            default=True, description="Enable all code analysis features."
         )
         code_similarity_threshold: float = Field(
-            default=0.85, description="Umbral de similitud para detectar duplicados."
+            default=0.85, description="Similarity threshold for detecting duplicates."
         )
         max_base_code_blocks: int = Field(
-            default=3,
-            description="Máximo de bloques de código base a mantener en contexto.",
+            default=3, description="Maximum base code blocks to keep in context."
         )
 
         project_id: str = Field(
-            default="default",
-            description="Identificador del proyecto (memoria compartida).",
+            default="default", description="Project identifier (shared memory)."
         )
 
         max_proposed_changes: int = Field(
-            default=5, description="Máximo de cambios propuestos a conservar."
+            default=5, description="Maximum proposed changes to keep."
         )
         max_committed_changes: int = Field(
-            default=10, description="Máximo de cambios aplicados a conservar."
+            default=10, description="Maximum committed changes to keep."
         )
         prioritize_recent_code: bool = Field(
-            default=True,
-            description="Conservar la versión más reciente del código similar.",
+            default=True, description="Keep the newest version of similar code."
         )
         auto_detect_code_blocks: bool = Field(
-            default=True,
-            description="Detectar bloques de código cercados e indentados.",
+            default=True, description="Detect fenced and indented code blocks."
         )
         max_cached_projects: int = Field(
-            default=10, description="Máximo de proyectos a mantener en caché LRU."
+            default=10, description="Maximum projects in LRU cache."
         )
         track_file_paths: bool = Field(
-            default=True, description="Extraer rutas de archivo de los mensajes."
+            default=True, description="Extract file paths from messages."
         )
         max_active_blocks: int = Field(
-            default=50, description="Máximo de bloques activos por conversación."
+            default=50, description="Maximum active code blocks per conversation."
         )
         file_path_pattern: str = Field(
             default=r"\b([a-zA-Z0-9_\-\./]+\.(py|js|ts|jsx|tsx|go|rs|java|cpp|c|h|hpp))\b",
-            description="Expresión regular para detectar rutas de archivo.",
+            description="Regex for file paths.",
         )
 
-        # Manejo de bloques de código demasiado grandes
+        # Oversized code block handling
         max_code_block_tokens: int = Field(
-            default=20000,
-            description="Tamaño máximo en tokens para un bloque de código (0 = sin límite).",
+            default=20000, description="Maximum tokens for a code block (0 = no limit)."
         )
         code_block_overflow_action: str = Field(
             default="summarize",
-            description="Acción para bloques que exceden el límite: 'truncate', 'summarize' o 'warn'.",
+            description="Action for oversized blocks: 'truncate', 'summarize', or 'warn'.",
         )
         code_block_summary_model: str = Field(
-            default="", description="Modelo para resumir bloques demasiado grandes."
+            default="", description="Model for summarizing oversized blocks."
         )
         code_block_truncate_keep_head: int = Field(
-            default=50,
-            description="Número de líneas a conservar del principio al truncar.",
+            default=50, description="Lines to keep from beginning when truncating."
         )
         code_block_truncate_keep_tail: int = Field(
-            default=50, description="Número de líneas a conservar del final al truncar."
+            default=50, description="Lines to keep from end when truncating."
         )
         code_block_warn_message: str = Field(
-            default="[Bloque de código demasiado grande - truncado por el sistema]",
-            description="Texto de reemplazo cuando la acción es 'warn'.",
+            default="[Code block too large - truncated by system]",
+            description="Replacement text for warn action.",
         )
 
         importance_mention_boost: float = Field(
-            default=0.2, description="Bonus adicional por mención (0-1)."
+            default=0.2, description="Additional importance per mention (0-1)."
         )
         importance_recency_half_life_hours: float = Field(
-            default=2.0, description="Vida media de la recencia para la importancia."
+            default=2.0, description="Recency half-life for importance."
         )
 
         ltm_compress_after_messages: int = Field(
-            default=50,
-            description="Número de mensajes tras los cuales comprimir entradas antiguas de LTM.",
+            default=50, description="Messages after which to compress old LTM entries."
         )
         ltm_summarization_trigger_similarity: float = Field(
-            default=0.85,
-            description="Umbral de similitud para activar resúmenes de duplicados en LTM.",
+            default=0.85, description="Similarity threshold for LTM compression."
         )
 
         enable_diff_application: bool = Field(
-            default=True, description="Aplicar diffs unificados al código base."
+            default=True, description="Apply unified diffs to base code."
         )
         preserve_error_context: bool = Field(
-            default=True, description="Nunca descartar mensajes de error."
+            default=True, description="Never drop error messages."
         )
         error_retention_turns: int = Field(
-            default=15, description="Número de turnos que mantener los errores vivos."
+            default=15, description="Turns to keep errors."
         )
         block_expiration_hours: float = Field(
-            default=24.0,
-            description="Horas tras las cuales los bloques inactivos pueden expirar.",
+            default=24.0, description="Hours after which inactive blocks expire."
         )
         proposed_change_retention_turns: int = Field(
-            default=20, description="Turnos que mantener los cambios propuestos."
+            default=20, description="Turns to keep proposed changes."
         )
         preserve_tool_calls: bool = Field(
-            default=True, description="Mantener cadenas de tool calls intactas."
+            default=True, description="Keep tool call chains intact."
         )
 
         enable_feedback_tracking: bool = Field(
-            default=True,
-            description="Registrar retroalimentación sobre cambios aplicados.",
+            default=True, description="Record feedback about applied changes."
         )
         feedback_history_limit: int = Field(
-            default=10,
-            description="Máximo de entradas de retroalimentación por proyecto.",
+            default=10, description="Maximum feedback entries per project."
         )
         inject_feedback_context: bool = Field(
-            default=True,
-            description="Inyectar retroalimentación reciente en el prompt del sistema.",
+            default=True, description="Inject recent feedback into system prompt."
         )
         feedback_importance_penalty_for_failure: float = Field(
-            default=2.0, description="Reducción de importancia para cambios fallidos."
+            default=2.0, description="Penalty for failed changes."
         )
 
         code_block_pattern: str = Field(
-            default="```(\\w*)\\n(.*?)```",
-            description="Expresión regular para bloques de código cercados.",
+            default="```(\\w*)\\n(.*?)```", description="Regex for fenced code blocks."
         )
         diff_pattern: str = Field(
             default="@@\\s*-([0-9]+),([0-9]+)\\s*\\+([0-9]+),([0-9]+)\\s*@@",
-            description="Expresión regular para hunks de diff.",
+            description="Diff hunk regex.",
         )
         commit_pattern: str = Field(
-            default="commit\\s+([a-f0-9]{7,40})",
-            description="Expresión regular para hashes de commit.",
+            default="commit\\s+([a-f0-9]{7,40})", description="Commit hash regex."
         )
 
         enable_dependency_tracking: bool = Field(
-            default=False,
-            description="Extraer dependencias y marcar bloques afectados.",
+            default=False, description="Extract dependencies and mark affected blocks."
         )
         dependency_extraction_model: str = Field(
-            default="", description="Modelo para extraer dependencias."
+            default="",
+            description="Model for dependency extraction (fallback for non-Python).",
         )
         dependency_refresh_on_update: bool = Field(
-            default=True,
-            description="Volver a extraer dependencias cuando se actualiza un bloque.",
+            default=True, description="Re-extract dependencies on update."
         )
         affected_importance_penalty: float = Field(
-            default=0.7,
-            description="Multiplicador de importancia para bloques afectados por cambios en dependencias.",
+            default=0.7, description="Importance multiplier for affected blocks."
         )
         affected_decay_hours: float = Field(
-            default=4.0,
-            description="Horas hasta que se elimina la marca de 'afectado'.",
+            default=4.0, description="Hours until affected flag clears."
         )
 
         track_active_code_age: bool = Field(
-            default=True,
-            description="Marcar código como inactivo tras un tiempo de espera.",
+            default=True, description="Mark code inactive after timeout."
         )
         active_code_timeout_minutes: int = Field(
-            default=30,
-            description="Minutos tras los cuales el código inactivo puede ser resumido.",
+            default=30, description="Timeout for active code."
         )
 
         summarize_inactive_code: bool = Field(
-            default=True, description="Resumir bloques de código inactivos."
+            default=True, description="Summarize inactive code blocks."
         )
         inactive_code_summary_model: str = Field(
-            default="gpt-3.5-turbo", description="Modelo para resumir código inactivo."
+            default="gpt-3.5-turbo", description="Model for inactive code summaries."
         )
 
         llm_model: str = Field(
             default="",
-            description="Modelo preferido (ej. 'ollama/llama3.2:3b'). Si falla, usa summarization_model.",
+            description="Preferred model (e.g., 'ollama/llama3.2:3b'). Falls back to summarization_model.",
         )
 
         enable_forget_command: bool = Field(
-            default=True, description="Permitir comandos /forget."
+            default=True, description="Allow /forget commands."
         )
         enable_natural_language_forget: bool = Field(
-            default=True, description="Interpretar olvido en lenguaje natural."
+            default=True, description="Interpret natural language forget."
         )
         natural_language_forget_model: str = Field(
-            default="", description="Modelo para interpretar intenciones de olvido."
+            default="", description="Model for forget intent parsing."
         )
 
     class UserValves(BaseModel):
@@ -642,6 +623,7 @@ class Filter:
             "facts": [],
             "last_compression_timestamp": 0,
             "last_suggestion_timestamp": 0,
+            "response_cache": [],
         }
         self.code_pattern = re.compile(self.valves.code_block_pattern, re.DOTALL)
         self.diff_pattern = re.compile(self.valves.diff_pattern)
@@ -650,23 +632,23 @@ class Filter:
         if HAS_TIKTOKEN and self.valves.use_tiktoken:
             try:
                 self.tokenizer = tiktoken.get_encoding("cl100k_base")
-                self._log_debug("Tiktoken inicializado")
+                self._log_debug("Tiktoken initialized")
             except Exception as e:
-                logger.warning(f"Fallo al cargar tiktoken: {e}")
+                logger.warning(f"Failed to load tiktoken: {e}")
 
         if HAS_SENTENCE and HAS_CHROMA and self.valves.enable_code_awareness:
             self._init_long_term_memory()
         else:
-            logger.warning("Memoria a largo plazo o análisis de código desactivado")
+            logger.warning("Long‑term memory or code awareness disabled")
 
         if self.valves.enable_reranking and HAS_CROSS_ENCODER:
             self._load_reranker()
 
         if self.valves.enable_facts:
-            self._log_debug("Almacenamiento de hechos activado.")
+            self._log_debug("Fact storage enabled.")
 
     # --------------------------------------------------------------------------
-    # Caché LRU
+    # LRU cache
     # --------------------------------------------------------------------------
     def _get_state(self, project_id: str) -> Dict:
         if project_id in self._conversation_state:
@@ -679,7 +661,7 @@ class Filter:
         self._conversation_state.move_to_end(project_id)
         while len(self._conversation_state) > self.valves.max_cached_projects:
             oldest = next(iter(self._conversation_state))
-            self._log_debug(f"Expulsando proyecto {oldest} de la caché")
+            self._log_debug(f"Evicting project {oldest} from cache")
             del self._conversation_state[oldest]
         return state
 
@@ -689,7 +671,7 @@ class Filter:
         self._save_state_to_db(project_id, state)
 
     # --------------------------------------------------------------------------
-    # Base de datos
+    # Database
     # --------------------------------------------------------------------------
     def _init_state_db(self):
         db_path = self.valves.state_db_path
@@ -703,7 +685,7 @@ class Filter:
             )
         """)
         self._db_conn.execute("PRAGMA journal_mode=WAL")
-        self._log_debug(f"Base de datos de estado inicializada en {db_path}")
+        self._log_debug(f"State DB initialized at {db_path}")
 
     def _get_project_id(self) -> str:
         return self.valves.project_id
@@ -725,6 +707,8 @@ class Filter:
             data["facts"] = []
         if "last_suggestion_timestamp" not in data:
             data["last_suggestion_timestamp"] = 0
+        if "response_cache" not in data:
+            data["response_cache"] = []
         active = {}
         for k, v in data.get("active_blocks", {}).items():
             active[k] = CodeBlock(**v)
@@ -742,6 +726,7 @@ class Filter:
             "iterative_state": data.get("iterative_state"),
             "message_count": data.get("message_count", 0),
             "last_compression_timestamp": data.get("last_compression_timestamp", 0),
+            "response_cache": data.get("response_cache", []),
             "last_suggestion_timestamp": data.get("last_suggestion_timestamp", 0),
         }
 
@@ -755,6 +740,7 @@ class Filter:
             "iterative_state": state.get("iterative_state"),
             "message_count": state["message_count"],
             "last_compression_timestamp": state.get("last_compression_timestamp", 0),
+            "response_cache": state.get("response_cache", []),
             "last_suggestion_timestamp": state.get("last_suggestion_timestamp", 0),
         }
         self._db_conn.execute(
@@ -764,14 +750,14 @@ class Filter:
         self._db_conn.commit()
 
     # --------------------------------------------------------------------------
-    # Depuración
+    # Debug logging
     # --------------------------------------------------------------------------
     def _log_debug(self, msg: str):
         if self.valves.debug:
             logger.debug(msg)
 
     # --------------------------------------------------------------------------
-    # Inicialización de LTM
+    # LTM initialization
     # --------------------------------------------------------------------------
     def _init_long_term_memory(self):
         os.makedirs(self.valves.long_term_memory_dir, exist_ok=True)
@@ -784,7 +770,7 @@ class Filter:
             name="conversation_memory", metadata={"hnsw:space": "cosine"}
         )
         self._purge_expired_memories()
-        self._log_debug("LTM lista")
+        self._log_debug("LTM ready")
 
     def _purge_expired_memories(self):
         if not HAS_CHROMA or self.memory_collection is None:
@@ -796,12 +782,12 @@ class Filter:
             expired = self.memory_collection.get(where={"expires_at": {"$lt": now}})
             if expired and expired["ids"]:
                 self.memory_collection.delete(ids=expired["ids"])
-                self._log_debug(f"Purgadas {len(expired['ids'])} memorias expiradas")
+                self._log_debug(f"Purged {len(expired['ids'])} expired memories")
         except Exception as e:
-            logger.warning(f"Fallo al purgar memorias: {e}")
+            logger.warning(f"Purge failed: {e}")
 
     # --------------------------------------------------------------------------
-    # Advertencia proactiva de contexto
+    # Proactive context warning
     # --------------------------------------------------------------------------
     def _check_context_usage_and_warn(
         self, system_msgs: List[dict], history_msgs: List[dict]
@@ -821,7 +807,7 @@ class Filter:
         return None
 
     # --------------------------------------------------------------------------
-    # Gestión de hechos
+    # Fact management
     # --------------------------------------------------------------------------
     def _extract_facts_from_message(self, content: str) -> List[str]:
         pattern = r"\[FACT:\s*(.*?)\]"
@@ -848,7 +834,7 @@ class Filter:
         if len(state["facts"]) > 100:
             state["facts"] = state["facts"][-100:]
         self._set_state(project_id, state)
-        self._log_debug(f"Hecho añadido: {fact_text[:50]}...")
+        self._log_debug(f"Added fact: {fact_text[:50]}...")
 
     async def _remove_fact(self, project_id: str, fact_text_or_index: str):
         state = self._get_state(project_id)
@@ -865,7 +851,7 @@ class Filter:
             ]
         if len(state["facts"]) != original_len:
             self._set_state(project_id, state)
-            self._log_debug(f"Hecho eliminado: {fact_text_or_index}")
+            self._log_debug(f"Removed fact: {fact_text_or_index}")
 
     def _get_facts_context(self, project_id: str) -> str:
         state = self._get_state(project_id)
@@ -879,12 +865,191 @@ class Filter:
             active_facts.append(f["fact"])
         if not active_facts:
             return ""
-        return "## Hechos acordados explícitamente\n" + "\n".join(
+        return "## Explicitly Agreed Facts\n" + "\n".join(
             [f"- {fact}" for fact in active_facts]
         )
 
     # --------------------------------------------------------------------------
-    # Manejo de bloques de código demasiado grandes
+    # Response cache (semantic caching)
+    # --------------------------------------------------------------------------
+    def _compute_context_hash(self, messages: List[dict]) -> str:
+        if not self.valves.response_cache_include_context_hash:
+            return ""
+        sys_msgs = [m for m in messages if m.get("role") == "system"]
+        context_str = "\n".join([m.get("content", "") for m in sys_msgs])
+        return hashlib.md5(context_str.encode()).hexdigest()[:16]
+
+    async def _find_cached_response(
+        self, query: str, context_hash: str, state: Dict
+    ) -> Optional[Dict]:
+        if not self.valves.enable_response_cache or not HAS_SENTENCE:
+            return None
+        cache = state.get("response_cache", [])
+        if not cache:
+            return None
+        try:
+            q_emb = self.embedder.encode(query).tolist()
+        except Exception as e:
+            self._log_debug(f"Failed to encode query for cache: {e}")
+            return None
+        best_sim = 0.0
+        best_entry = None
+        now = time.time()
+        ttl = self.valves.response_cache_ttl_hours * 3600
+        for entry in cache:
+            if ttl > 0 and (now - entry.get("timestamp", 0)) > ttl:
+                continue
+            if (
+                self.valves.response_cache_include_context_hash
+                and entry.get("context_hash", "") != context_hash
+            ):
+                continue
+            entry_emb = entry.get("embedding")
+            if not entry_emb:
+                continue
+            sim = self._cosine_similarity(q_emb, entry_emb)
+            if (
+                sim > best_sim
+                and sim >= self.valves.response_cache_similarity_threshold
+            ):
+                best_sim = sim
+                best_entry = entry
+        if best_entry:
+            self._log_debug(
+                f"Cache hit (similarity={best_sim:.3f}) for query: {query[:50]}..."
+            )
+            return best_entry
+        return None
+
+    async def _store_response_in_cache(
+        self, query: str, response: str, context_hash: str, state: Dict
+    ):
+        if not self.valves.enable_response_cache or not HAS_SENTENCE:
+            return
+        if not query or not response:
+            return
+        try:
+            embedding = self.embedder.encode(query).tolist()
+        except Exception as e:
+            self._log_debug(f"Failed to encode query for cache storage: {e}")
+            return
+        cache = state.get("response_cache", [])
+        new_cache = [e for e in cache if e.get("query") != query]
+        new_entry = {
+            "query": query,
+            "response": response,
+            "embedding": embedding,
+            "timestamp": time.time(),
+            "context_hash": context_hash,
+        }
+        new_cache.append(new_entry)
+        if len(new_cache) > self.valves.response_cache_max_entries:
+            new_cache.sort(key=lambda x: x.get("timestamp", 0))
+            new_cache = new_cache[-self.valves.response_cache_max_entries :]
+        state["response_cache"] = new_cache
+        self._log_debug(f"Stored response in cache for query: {query[:50]}...")
+
+    async def _recall_command(self, project_id: str, query_part: str) -> str:
+        state = self._get_state(project_id)
+        if not state:
+            return "No active project state."
+        context_hash = self._compute_context_hash([])
+        entry = await self._find_cached_response(query_part, context_hash, state)
+        if entry:
+            return f"**Cached response** (similarity: high)\n{entry['response']}"
+        else:
+            return f"No cached response found for query: {query_part}"
+
+    # --------------------------------------------------------------------------
+    # AST-based dependency extraction (for Python)
+    # --------------------------------------------------------------------------
+    def _extract_dependencies_ast(self, code: str) -> Tuple[List[str], List[str]]:
+        imports = []
+        calls = []
+        try:
+            tree = ast.parse(code)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        imports.append(alias.name)
+                elif isinstance(node, ast.ImportFrom):
+                    module = node.module or ""
+                    for alias in node.names:
+                        imports.append(
+                            f"{module}.{alias.name}" if module else alias.name
+                        )
+                elif isinstance(node, ast.Call):
+                    if isinstance(node.func, ast.Name):
+                        calls.append(node.func.id)
+                    elif isinstance(node.func, ast.Attribute):
+                        calls.append(node.func.attr)
+        except SyntaxError:
+            pass
+        return list(set(imports)), list(set(calls))
+
+    async def _extract_dependencies_hybrid(
+        self, code: str, file_path: Optional[str] = None
+    ) -> List[str]:
+        if not self.valves.enable_dependency_tracking:
+            return []
+        lang = "unknown"
+        if file_path:
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext == ".py":
+                lang = "python"
+        else:
+            if re.search(r"\bdef\s+\w+\s*\(", code) and re.search(
+                r"\bimport\s+\w+", code
+            ):
+                lang = "python"
+
+        if lang == "python":
+            imports, calls = self._extract_dependencies_ast(code)
+            return list(set(imports + calls))
+        else:
+            model = (
+                self.valves.dependency_extraction_model
+                or self.valves.llm_model
+                or self.valves.summarization_model
+            )
+            prompt = f"""Analyze the following code and extract dependencies:
+- Import statements
+- Function calls to external/user-defined functions (by name)
+- Class instantiations or references
+- File paths (e.g., './utils.py')
+
+Output a JSON array of strings, each string a simple identifier or path.
+If no dependencies, output [].
+
+Code:
+```{code[:1500]}```
+
+Example output: ["os", "Path", "utils.py", "calculate_total"]
+"""
+            response = await self._call_llm(
+                prompt=prompt,
+                system_prompt="You output only JSON arrays.",
+                model_override=model,
+                max_tokens=300,
+                temperature=0.1,
+            )
+            if not response:
+                return []
+            try:
+                response = response.strip()
+                if response.startswith("```json"):
+                    response = response[7:]
+                if response.endswith("```"):
+                    response = response[:-3]
+                deps = json.loads(response)
+                if isinstance(deps, list):
+                    return list(set(deps))
+            except:
+                pass
+            return []
+
+    # --------------------------------------------------------------------------
+    # Oversized code block handling
     # --------------------------------------------------------------------------
     def _estimate_code_tokens(self, code: str) -> int:
         if self.tokenizer:
@@ -901,7 +1066,7 @@ class Filter:
 
         action = self.valves.code_block_overflow_action.lower()
         self._log_debug(
-            f"Bloque de código de {estimated} tokens excede el límite ({max_tokens}). Acción: {action}"
+            f"Code block of {estimated} tokens exceeds limit ({max_tokens}). Action: {action}"
         )
 
         if action == "truncate":
@@ -912,7 +1077,7 @@ class Filter:
                 return code
             truncated = "\n".join(
                 lines[:head]
-                + [f"... [{len(lines) - head - tail} líneas truncadas] ..."]
+                + [f"... [{len(lines) - head - tail} lines truncated] ..."]
                 + lines[-tail:]
             )
             return truncated
@@ -923,29 +1088,31 @@ class Filter:
                 or self.valves.llm_model
                 or self.valves.summarization_model
             )
-            prompt = f"""Resume el siguiente bloque de código {language}. Céntrate en:
-- Qué hace el código (propósito)
-- Funciones/clases principales y sus firmas
-- Lógica o algoritmos importantes
-- Dependencias externas relevantes
+            prompt = f"""Summarize the following {language} code block. Focus on:
+- What the code does (purpose)
+- Key functions/classes and their signatures
+- Important logic or algorithms
+- Any relevant external dependencies
 
-Mantén el resumen conciso (máx. 300 palabras).
+Keep the summary concise (max 300 words).
 
-Código:
+Code:
 ```{language}
 {code[:8000]}
 ```"""
             summary = await self._call_llm(
                 prompt=prompt,
-                system_prompt="Eres un asistente de resumen de código. Solo genera el resumen, sin texto extra.",
+                system_prompt="You are a code summarization assistant. Output only the summary, no extra text.",
                 model_override=model,
                 max_tokens=500,
                 temperature=0.2,
             )
             if summary:
-                return f"[Resumen automático de un bloque de código de {estimated} tokens]\n{summary}"
+                return (
+                    f"[Automatic summary of a {estimated} token code block]\n{summary}"
+                )
             else:
-                return f"[Bloque de código demasiado grande, no se pudo resumir] Tamaño original: {estimated} tokens."
+                return f"[Code block too large, could not summarize] Original size: {estimated} tokens."
 
         elif action == "warn":
             return self.valves.code_block_warn_message
@@ -954,61 +1121,24 @@ Código:
             return code
 
     # --------------------------------------------------------------------------
-    # Extracción de dependencias
+    # Dependency update helpers (using hybrid extraction)
     # --------------------------------------------------------------------------
-    async def _extract_dependencies(
-        self, code: str, file_path: Optional[str] = None
-    ) -> List[str]:
-        if not self.valves.enable_dependency_tracking:
-            return []
-        model = (
-            self.valves.dependency_extraction_model
-            or self.valves.llm_model
-            or self.valves.summarization_model
-        )
-        prompt = f"""Analiza el siguiente código y extrae sus dependencias:
-- Sentencias import
-- Llamadas a funciones externas o definidas por el usuario (por nombre)
-- Instanciaciones o referencias a clases
-- Rutas de archivo (ej. './utils.py')
-
-Devuelve un array JSON de cadenas, cada cadena un identificador o ruta simple.
-Si no hay dependencias, devuelve [].
-
-Código:
-```{code[:1500]}```
-
-Ejemplo de salida: ["os", "Path", "utils.py", "calculate_total"]
-"""
-        response = await self._call_llm(
-            prompt=prompt,
-            system_prompt="Solo genera JSON arrays.",
-            model_override=model,
-            max_tokens=300,
-            temperature=0.1,
-        )
-        if not response:
-            return []
-        try:
-            response = response.strip()
-            if response.startswith("```json"):
-                response = response[7:]
-            if response.endswith("```"):
-                response = response[:-3]
-            deps = json.loads(response)
-            if isinstance(deps, list):
-                return list(set(deps))
-        except:
-            pass
-        return []
-
     async def _update_dependencies(self, block_hash: str, state: Dict):
         block = state["active_blocks"].get(block_hash)
         if not block:
             return
-        deps = await self._extract_dependencies(block.content, block.file_path)
+        deps = await self._extract_dependencies_hybrid(block.content, block.file_path)
+        # Also store AST-specific fields for later reference
+        if (
+            block.file_path
+            and block.file_path.endswith(".py")
+            or "def " in block.content
+        ):
+            imports, calls = self._extract_dependencies_ast(block.content)
+            block.ast_imports = imports
+            block.ast_calls = calls
         block.dependencies = deps
-        self._log_debug(f"Dependencias actualizadas para bloque {block_hash}: {deps}")
+        self._log_debug(f"Updated dependencies for block {block_hash}: {deps}")
 
     async def _mark_affected_blocks(self, changed_hash: str, state: Dict):
         changed_block = state["active_blocks"].get(changed_hash)
@@ -1027,12 +1157,17 @@ Ejemplo de salida: ["os", "Path", "utils.py", "calculate_total"]
         for h, block in state["active_blocks"].items():
             if h == changed_hash:
                 continue
-            if any(dep in affected_identifiers for dep in block.dependencies):
+            block_deps = (
+                block.dependencies
+                + getattr(block, "ast_imports", [])
+                + getattr(block, "ast_calls", [])
+            )
+            if any(dep in affected_identifiers for dep in block_deps):
                 block.potentially_affected = True
                 block.affected_timestamp = time.time()
                 block._update_importance()
                 self._log_debug(
-                    f"Bloque {h} marcado como potencialmente afectado por dependencia con {changed_hash}"
+                    f"Block {h} marked as potentially affected due to dependency on {changed_hash}"
                 )
 
     async def _refresh_dependencies_for_block(self, block_hash: str, project_id: str):
@@ -1061,7 +1196,7 @@ Ejemplo de salida: ["os", "Path", "utils.py", "calculate_total"]
                 block.potentially_affected = False
                 block._update_importance()
                 changed = True
-                self._log_debug(f"Eliminada marca de afectado para bloque {block.hash}")
+                self._log_debug(f"Cleared affected flag for block {block.hash}")
         if changed:
             self._set_state(project_id, state)
 
@@ -1074,9 +1209,9 @@ Ejemplo de salida: ["os", "Path", "utils.py", "calculate_total"]
         if self._cross_encoder is None:
             try:
                 self._cross_encoder = CrossEncoder(self.valves.reranker_model)
-                self._log_debug(f"Cargado modelo reranker {self.valves.reranker_model}")
+                self._log_debug(f"Loaded reranker model {self.valves.reranker_model}")
             except Exception as e:
-                logger.warning(f"Fallo al cargar el reranker: {e}")
+                logger.warning(f"Failed to load reranker model: {e}")
                 self.valves.enable_reranking = False
 
     async def _rerank_results(
@@ -1091,7 +1226,7 @@ Ejemplo de salida: ["os", "Path", "utils.py", "calculate_total"]
         return [doc for doc, _ in scored[:top_k]]
 
     # --------------------------------------------------------------------------
-    # Extracción y clasificación de código
+    # Code extraction and classification
     # --------------------------------------------------------------------------
     async def _extract_code_blocks(self, content: str) -> List[Dict[str, Any]]:
         blocks = []
@@ -1145,13 +1280,11 @@ Ejemplo de salida: ["os", "Path", "utils.py", "calculate_total"]
     ) -> ContentType:
         cl = content.lower()
         if self.valves.enable_feedback_tracking:
-            if re.search(
-                r"\b(funcionó|sí|correcto|bien|resuelto|funciona)\b", cl
-            ) and re.search(r"\b(cambio|solución|arreglo|diff)\b", cl):
-                return ContentType.GENERAL
-            if re.search(
-                r"\b(no funcionó|falló|error|sigue igual|no resuelve|incorrecto)\b", cl
+            if re.search(r"\b(worked|yes|correct|resolved|fixed)\b", cl) and re.search(
+                r"\b(change|solution|fix|diff)\b", cl
             ):
+                return ContentType.GENERAL
+            if re.search(r"\b(did not work|failed|error|still broken|incorrect)\b", cl):
                 return ContentType.GENERAL
             if content.startswith("/feedback"):
                 return ContentType.GENERAL
@@ -1184,19 +1317,19 @@ Ejemplo de salida: ["os", "Path", "utils.py", "calculate_total"]
         return ContentType.GENERAL
 
     # --------------------------------------------------------------------------
-    # Prompts de resumen según tipo de contenido
+    # Helper: content-aware summarization prompt
     # --------------------------------------------------------------------------
     def _get_summary_prompt_for_content(
         self, content_type: ContentType, text: str, max_tokens: int
     ) -> str:
         if not self.valves.selective_summarization:
-            return f"Resume la siguiente conversación. Conserva las decisiones clave, acciones y contexto importante. Sé conciso.\n\n{text}"
+            return f"Summarise the following conversation. Keep key decisions, actions, and important context. Be concise.\n\n{text}"
 
         if content_type == ContentType.ERROR:
             if self.valves.error_preserve_verbatim:
                 return text
             else:
-                return f"Resume el siguiente mensaje de error, conservando el tipo de error, ubicación y causa raíz. No omitas detalles técnicos.\n\n{text}"
+                return f"Summarise the following error message, keeping the error type, location, and root cause. Do not omit technical details.\n\n{text}"
         elif content_type in (
             ContentType.BASE_CODE,
             ContentType.PROPOSED_CHANGE,
@@ -1204,19 +1337,19 @@ Ejemplo de salida: ["os", "Path", "utils.py", "calculate_total"]
         ):
             level = self.valves.code_summary_level
             if level == "minimal":
-                instruction = "Extrae solo las firmas de funciones/clases y el propósito general. No incluyas detalles de implementación."
+                instruction = "Extract only the function/class signatures and the overall purpose. Do not include implementation details."
             elif level == "detailed":
-                instruction = "Resume el código, conservando funciones clave, clases, lógica importante y comentarios. Un nivel de detalle medio."
+                instruction = "Summarise the code, keeping key functions, classes, important logic, and any comments. Aim for a medium level of detail."
             else:
-                instruction = "Resume el código, centrándote en lo que hace, sus funciones/clases principales y cualquier lógica no trivial."
+                instruction = "Summarise the code, focusing on what it does, its main functions/classes, and any non-trivial logic."
             return f"{instruction}\n\n```\n{text[:3000]}\n```"
         elif content_type == ContentType.TOOL_CALL:
             if self.valves.tool_call_preserve:
                 return text
             else:
-                return f"Resume la siguiente secuencia de llamadas a herramientas, conservando los nombres de las herramientas y los parámetros principales.\n\n{text}"
+                return f"Summarise the following tool call sequence, keeping the tool names and main parameters.\n\n{text}"
         else:
-            return f"Resume la siguiente conversación, conservando las decisiones clave, elementos de acción y problemas pendientes. Sé conciso (objetivo {max_tokens} tokens).\n\n{text}"
+            return f"Summarise the following conversation, keeping key decisions, action items, and unresolved issues. Be concise (target {max_tokens} tokens).\n\n{text}"
 
     # --------------------------------------------------------------------------
     # LLM helper
@@ -1265,16 +1398,16 @@ Ejemplo de salida: ["os", "Path", "utils.py", "calculate_total"]
                             return data["choices"][0]["message"]["content"].strip()
                         else:
                             self._log_debug(
-                                f"LLM falló con modelo {model}, estado {resp.status}"
+                                f"LLM call failed with model {model}, status {resp.status}"
                             )
             except Exception as e:
-                self._log_debug(f"Error con modelo {model}: {e}")
+                self._log_debug(f"LLM model {model} error: {e}")
                 continue
-        logger.warning(f"Todos los modelos LLM fallaron para prompt: {prompt[:100]}...")
+        logger.warning(f"All LLM models failed for prompt: {prompt[:100]}...")
         return None
 
     # --------------------------------------------------------------------------
-    # Funciones auxiliares (nombres, firmas, similitud)
+    # Helpers for function names, signatures, similarity
     # --------------------------------------------------------------------------
     def _extract_function_names(self, code: str) -> List[str]:
         names = []
@@ -1326,9 +1459,9 @@ Ejemplo de salida: ["os", "Path", "utils.py", "calculate_total"]
             if doc_match:
                 docstring = doc_match.group(1).strip()[:100]
             return (
-                f"Función `{name}({params})` - {docstring}"
+                f"Function `{name}({params})` - {docstring}"
                 if docstring
-                else f"Función `{name}({params})`"
+                else f"Function `{name}({params})`"
             )
         class_match = re.search(
             r"^\s*class\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:\([^)]*\))?\s*:",
@@ -1345,7 +1478,7 @@ Ejemplo de salida: ["os", "Path", "utils.py", "calculate_total"]
                     r"^\s*'''(.*?)'''", code[class_match.end() :], re.DOTALL
                 )
             docstring = doc_match.group(1).strip()[:100] if doc_match else ""
-            return f"Clase `{name}` - {docstring}" if docstring else f"Clase `{name}`"
+            return f"Class `{name}` - {docstring}" if docstring else f"Class `{name}`"
         return ""
 
     def _update_mentions_from_message(self, state: Dict, message_content: str):
@@ -1359,7 +1492,7 @@ Ejemplo de salida: ["os", "Path", "utils.py", "calculate_total"]
                     block.last_mentioned = time.time()
                     block._update_importance()
                     self._log_debug(
-                        f"Importancia aumentada para {block.hash} por mención de '{name}'"
+                        f"Boosted importance of {block.hash} due to mention of '{name}'"
                     )
                     break
 
@@ -1372,8 +1505,14 @@ Ejemplo de salida: ["os", "Path", "utils.py", "calculate_total"]
             return common / max(len(code1), len(code2))
         return fuzz.token_sort_ratio(code1, code2) / 100.0
 
+    def _cosine_similarity(self, a, b):
+        dot = sum(x * y for x, y in zip(a, b))
+        norm_a = sum(x * x for x in a) ** 0.5
+        norm_b = sum(y * y for y in b) ** 0.5
+        return dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
+
     # --------------------------------------------------------------------------
-    # Aplicación de diffs
+    # Diff application
     # --------------------------------------------------------------------------
     def _apply_unified_diff(self, original: str, diff_text: str) -> Optional[str]:
         if not self.valves.enable_diff_application:
@@ -1402,9 +1541,7 @@ Ejemplo de salida: ["os", "Path", "utils.py", "calculate_total"]
             hunks.append((old_start - 1, old_lines, new_lines))
         for old_start, old_lines, new_lines in reversed(hunks):
             if result_lines[old_start : old_start + len(old_lines)] != old_lines:
-                self._log_debug(
-                    "El hunk del diff no coincide con el código actual; se omite."
-                )
+                self._log_debug("Diff hunk does not match current code; skipping.")
                 continue
             result_lines = (
                 result_lines[:old_start]
@@ -1431,12 +1568,12 @@ Ejemplo de salida: ["os", "Path", "utils.py", "calculate_total"]
             base_block.is_active = True
             base_block.potentially_affected = False
             base_block.importance_score = min(base_block.importance_score + 2.0, 10.0)
-            self._log_debug(f"Diff aplicado al bloque base {base_block.hash}")
+            self._log_debug(f"Applied diff to base block {base_block.hash}")
             return True
         return False
 
     # --------------------------------------------------------------------------
-    # Detección de conflictos
+    # Conflict detection
     # --------------------------------------------------------------------------
     def _has_conflicting_proposed_changes(
         self, state: Dict, new_block: CodeBlock
@@ -1457,13 +1594,13 @@ Ejemplo de salida: ["os", "Path", "utils.py", "calculate_total"]
                 > 0.8
             ):
                 self._log_debug(
-                    f"Conflicto detectado entre cambios propuestos {existing.hash} y {new_block.hash}"
+                    f"Conflict detected between proposed changes {existing.hash} and {new_block.hash}"
                 )
                 return True
         return False
 
     # --------------------------------------------------------------------------
-    # Expiración de bloques (ignorando los anclados y obsoletos)
+    # Expiration (skip pinned and obsolete blocks)
     # --------------------------------------------------------------------------
     async def _expire_blocks_by_time(self, project_id: str):
         state = self._get_state(project_id)
@@ -1492,12 +1629,12 @@ Ejemplo de salida: ["os", "Path", "utils.py", "calculate_total"]
                     to_remove.append(h)
         for h in to_remove:
             del state["active_blocks"][h]
-            self._log_debug(f"Bloque expirado: {h}")
+            self._log_debug(f"Expired block {h}")
         if to_remove:
             self._set_state(project_id, state)
 
     # --------------------------------------------------------------------------
-    # Resumen de bloques inactivos
+    # Inactive code summarization
     # --------------------------------------------------------------------------
     async def _summarize_inactive_blocks_safely(self, project_id: str):
         if not self.valves.summarize_inactive_code:
@@ -1527,14 +1664,14 @@ Ejemplo de salida: ["os", "Path", "utils.py", "calculate_total"]
                 if sig:
                     summary = f"{sig}\n\n{summary}"
                 summary_block = CodeBlock(
-                    content=f"[Resumen de código inactivo]\n{summary}",
+                    content=f"[Summary of inactive code]\n{summary}",
                     content_type=ContentType.GENERAL,
                     timestamp=time.time(),
                     is_active=False,
                     importance_score=block.importance_score * 0.5,
                 )
                 state["active_blocks"][h] = summary_block
-                self._log_debug(f"Bloque inactivo resumido: {h}")
+                self._log_debug(f"Summarized inactive block {h}")
         self._set_state(project_id, state)
 
     async def _summarize_code_block(self, block: CodeBlock) -> Optional[str]:
@@ -1542,30 +1679,30 @@ Ejemplo de salida: ["os", "Path", "utils.py", "calculate_total"]
             return None
         sig = self._extract_signature(block.content)
         if sig:
-            prompt = f"""El bloque de código tiene la firma: {sig}
-Proporciona una descripción muy breve (máx. 50 palabras) de lo que hace este código.
-Código:
+            prompt = f"""The code block has signature: {sig}
+Provide a very brief (max 50 words) description of what this code does.
+Code:
 ```{block.content[:1000]}```
 """
         else:
-            prompt = f"""Resume el siguiente bloque de código. Incluye:
-1. Qué hace el código (propósito)
-2. Funciones/clases/variables clave
-3. Lógica importante o casos extremos
-Mantén el resumen por debajo de 150 palabras.
+            prompt = f"""Summarize the following code block. Include:
+1. What the code does (purpose)
+2. Key functions/classes/variables
+3. Any important logic or edge cases
+Keep the summary under 150 words.
 
 ```{block.content[:1500]}```
 """
         return await self._call_llm(
             prompt=prompt,
-            system_prompt="Eres un asistente de resumen de código.",
+            system_prompt="You are a code summarization assistant.",
             model_override=self.valves.inactive_code_summary_model,
             max_tokens=200,
             temperature=0.2,
         )
 
     # --------------------------------------------------------------------------
-    # Compresión jerárquica
+    # Hierarchical compression
     # --------------------------------------------------------------------------
     async def _hierarchical_compress(self, project_id: str, state: Dict):
         if not self.valves.hierarchical_compression_enabled:
@@ -1589,7 +1726,7 @@ Mantén el resumen por debajo de 150 palabras.
             )
         except Exception as e:
             self._log_debug(
-                f"Fallo al recuperar mensajes para compresión jerárquica: {e}"
+                f"Failed to fetch messages for hierarchical compression: {e}"
             )
             return
 
@@ -1613,26 +1750,26 @@ Mantén el resumen por debajo de 150 palabras.
             or self.valves.llm_model
             or self.valves.summarization_model
         )
-        prompt = f"""Resume el siguiente segmento de conversación, centrándote en:
-- Decisiones técnicas clave
-- Cambios de código y sus resultados
-- Problemas resueltos o aún abiertos
-- Contexto importante para interacciones futuras
+        prompt = f"""Summarise the following conversation segment, focusing on:
+- Key technical decisions
+- Code changes and their outcomes
+- Problems solved or still open
+- Important context for future interactions
 
-Mantén el resumen conciso (máx. {self.valves.hierarchical_summary_max_tokens // 4} palabras).
+Keep the summary concise (max {self.valves.hierarchical_summary_max_tokens // 4} words).
 
-Segmento:
+Conversation segment:
 {texts[:4000]}
 """
         summary = await self._call_llm(
             prompt=prompt,
-            system_prompt="Eres un asistente de resúmenes jerárquicos.",
+            system_prompt="You are a code-aware assistant creating concise hierarchical summaries.",
             model_override=model,
             max_tokens=self.valves.hierarchical_summary_max_tokens,
             temperature=0.2,
         )
         if not summary:
-            self._log_debug("Compresión jerárquica: falló la generación del resumen.")
+            self._log_debug("Hierarchical compression: summarization failed.")
             return
 
         summary_id = f"{project_id}_hierarchical_{int(time.time())}"
@@ -1653,337 +1790,87 @@ Segmento:
                 }
             ],
             documents=[
-                f"[Resumen jerárquico de {len(to_compress)} mensajes]\n{summary}"
+                f"[Hierarchical summary of {len(to_compress)} messages]\n{summary}"
             ],
         )
         self._log_debug(
-            f"Compresión jerárquica: creado resumen para {len(to_compress)} mensajes"
+            f"Hierarchical compression: created summary for {len(to_compress)} messages"
         )
         state["last_compression_timestamp"] = time.time()
         self._set_state(project_id, state)
 
     # --------------------------------------------------------------------------
-    # Marcado de obsoleto
+    # Duplicate removal (skip pinned and obsolete)
     # --------------------------------------------------------------------------
-    async def _parse_obsolete_intent(self, user_message: str) -> Optional[Dict]:
-        if not self.valves.enable_obsolete_marking:
-            return None
-        model = (
-            self.valves.natural_language_forget_model
-            or self.valves.llm_model
-            or self.valves.summarization_model
-        )
-        prompt = f"""Eres un intérprete de comandos. El usuario quiere marcar algo como obsoleto (ya no relevante).
-Acciones posibles:
-- "obsolete_last": marcar el último bloque de código como obsoleto.
-- "obsolete_n": marcar los últimos N bloques de código como obsoletos.
-- "obsolete_file": marcar todos los bloques relacionados con un archivo como obsoletos.
-- "obsolete_block": marcar un bloque específico (por hash, nombre de función o línea) como obsoleto.
-- "obsolete_all": marcar todos los bloques activos como obsoletos.
-- "revive_last": quitar la marca de obsoleto del último bloque.
-- "revive_file": quitar la marca de obsoleto de bloques relacionados con un archivo.
-- "revive_all": quitar todas las marcas de obsoleto.
-
-Mensaje del usuario: "{user_message}"
-
-Si el usuario quiere claramente marcar/desmarcar como obsoleto, genera JSON con la acción y los parámetros.
-Si no, genera {{"action": "none"}}
-
-Ejemplos:
-- "marca este bloque como obsoleto" -> {{"action": "obsolete_last"}}
-- "los últimos dos cambios ya no sirven" -> {{"action": "obsolete_n", "n": 2}}
-- "el archivo utils.py está obsoleto" -> {{"action": "obsolete_file", "file": "utils.py"}}
-- "revive la función calcular_total" -> {{"action": "revive_block", "description": "calcular_total"}}
-
-Devuelve solo JSON.
-"""
-        response = await self._call_llm(
-            prompt=prompt,
-            system_prompt="Solo devuelves JSON.",
-            model_override=model,
-            max_tokens=150,
-            temperature=0.1,
-        )
-        if not response:
-            return None
-        try:
-            response = response.strip()
-            if response.startswith("```json"):
-                response = response[7:]
-            if response.endswith("```"):
-                response = response[:-3]
-            data = json.loads(response)
-            if data.get("action") != "none":
-                self._log_debug(f"Intención de obsoleto interpretada: {data}")
-                return data
-        except:
-            pass
-        return None
-
-    def _set_obsolete_flag(self, blocks: List[CodeBlock], obsolete_value: bool):
-        for blk in blocks:
-            blk.obsolete = obsolete_value
-            blk._update_importance()
-            self._log_debug(f"Bloque {blk.hash} marcado como obsoleto={obsolete_value}")
-        return len(blocks)
-
-    async def _execute_obsolete_intent(self, project_id: str, intent: Dict) -> str:
-        state = self._get_state(project_id)
-        if not state:
-            return "No hay contexto activo para marcar como obsoleto."
-        action = intent.get("action", "")
+    def _remove_duplicate_blocks(self, state: Dict):
+        if not self.valves.auto_remove_duplicate_blocks:
+            return
         blocks = list(state["active_blocks"].values())
-        if not blocks:
-            return "No hay bloques disponibles."
-        if action == "obsolete_last":
-            last_block = max(blocks, key=lambda b: b.timestamp)
-            self._set_obsolete_flag([last_block], True)
-            return "Último bloque marcado como obsoleto."
-        elif action == "obsolete_n":
-            n = intent.get("n", 1)
-            blocks_by_time = sorted(blocks, key=lambda b: b.timestamp, reverse=True)
-            to_obsolete = blocks_by_time[:n]
-            count = self._set_obsolete_flag(to_obsolete, True)
-            return f"{count} bloque(s) marcado(s) como obsoleto(s)."
-        elif action == "obsolete_file":
-            file_path = intent.get("file", "")
-            if not file_path:
-                return "No se especificó archivo."
-            to_obsolete = [
-                blk for blk in blocks if blk.file_path and file_path in blk.file_path
+        to_remove = set()
+        for i, block in enumerate(blocks):
+            if block.hash in to_remove or block.pinned or block.obsolete:
+                continue
+            for j, other in enumerate(blocks[i + 1 :], start=i + 1):
+                if other.hash in to_remove or other.pinned or other.obsolete:
+                    continue
+                sim = self._calculate_code_similarity(block.content, other.content)
+                if sim >= self.valves.code_similarity_threshold:
+                    age_diff = abs(block.timestamp - other.timestamp) / 3600
+                    if age_diff > self.valves.max_duplicate_age_hours:
+                        if (
+                            block.timestamp < other.timestamp
+                            and block.importance_score < 5.0
+                        ):
+                            to_remove.add(block.hash)
+                        elif (
+                            other.timestamp < block.timestamp
+                            and other.importance_score < 5.0
+                        ):
+                            to_remove.add(other.hash)
+                        continue
+                    if block.importance_score >= other.importance_score:
+                        to_remove.add(other.hash)
+                    else:
+                        to_remove.add(block.hash)
+        if to_remove:
+            for h in to_remove:
+                if h in state["active_blocks"]:
+                    self._log_debug(
+                        f"Auto-removed duplicate block {h} (importance: {state['active_blocks'][h].importance_score:.1f})"
+                    )
+                    del state["active_blocks"][h]
+            state["recent_changes"] = [
+                b for b in state["recent_changes"] if b.hash not in to_remove
             ]
-            count = self._set_obsolete_flag(to_obsolete, True)
-            return f"{count} bloque(s) relacionado(s) con {file_path} marcado(s) como obsoleto(s)."
-        elif action == "obsolete_block":
-            desc = intent.get("description", "") or intent.get("hash", "")
-            if not desc:
-                return "No se especificó identificador del bloque."
-            matches = [
-                blk
-                for blk in blocks
-                if desc in blk.content
-                or (blk.hash and desc in blk.hash)
-                or (blk.file_path and desc in blk.file_path)
+            state["committed_changes"] = [
+                b for b in state["committed_changes"] if b.hash not in to_remove
             ]
-            count = self._set_obsolete_flag(matches, True)
-            return f"{count} bloque(s) que coinciden con '{desc}' marcado(s) como obsoleto(s)."
-        elif action == "obsolete_all":
-            count = self._set_obsolete_flag(blocks, True)
-            return f"Todos los {count} bloque(s) marcados como obsoletos."
-        elif action == "revive_last":
-            last_block = max(blocks, key=lambda b: b.timestamp)
-            self._set_obsolete_flag([last_block], False)
-            return "Marca de obsoleto eliminada del último bloque."
-        elif action == "revive_file":
-            file_path = intent.get("file", "")
-            if not file_path:
-                return "No se especificó archivo."
-            to_revive = [
-                blk for blk in blocks if blk.file_path and file_path in blk.file_path
-            ]
-            count = self._set_obsolete_flag(to_revive, False)
-            return f"Marca de obsoleto eliminada de {count} bloque(s) relacionado(s) con {file_path}."
-        elif action == "revive_all":
-            count = self._set_obsolete_flag(blocks, False)
-            return f"Marca de obsoleto eliminada de todos los {count} bloque(s)."
-        else:
-            return "Acción de obsoleto no reconocida."
 
     # --------------------------------------------------------------------------
-    # Sugerencia proactiva de resumen (predicción #1)
-    # --------------------------------------------------------------------------
-    async def _check_and_suggest_summarization(
-        self, project_id: str, current_tokens: int, max_tokens: int
-    ) -> Optional[str]:
-        if not self.valves.proactive_summary_threshold or max_tokens <= 0:
-            return None
-        usage_ratio = current_tokens / max_tokens
-        if usage_ratio < self.valves.proactive_summary_threshold:
-            return None
-        state = self._get_state(project_id)
-        if not state:
-            return None
-        obsolete_count = sum(1 for b in state["active_blocks"].values() if b.obsolete)
-        inactive_count = sum(
-            1
-            for b in state["active_blocks"].values()
-            if not b.is_active and not b.obsolete
-        )
-        suggestion_parts = []
-        if obsolete_count > 2:
-            suggestion_parts.append(
-                f"- Tienes {obsolete_count} bloque(s) obsoleto(s). Usa `/obsolete revive` si los necesitas, o se ignorarán."
-            )
-        if inactive_count > 5:
-            suggestion_parts.append(
-                f"- Hay {inactive_count} bloque(s) de código inactivos. Usa `/forget` para eliminarlos o `/remember` para anclar los importantes."
-            )
-        if not suggestion_parts:
-            suggestion_parts.append(
-                f"- El contexto está al {int(usage_ratio*100)}% de capacidad. Considera resumir conversaciones antiguas con `/summarize` o usar `/forget` para liberar espacio."
-            )
-        return "⚠️ **Contexto casi lleno**\n" + "\n".join(suggestion_parts)
-
-    # --------------------------------------------------------------------------
-    # Detección de preguntas repetidas (#2)
-    # --------------------------------------------------------------------------
-    async def _find_duplicate_question(
-        self, query: str, project_id: str
-    ) -> Optional[Dict]:
-        if not self.valves.duplicate_question_threshold or not HAS_SENTENCE:
-            return None
-        results = self.memory_collection.get(
-            where={"project_id": project_id, "role": "user"},
-            limit=self.valves.duplicate_question_lookback,
-            include=["documents", "metadatas"],
-        )
-        if not results or not results["documents"]:
-            return None
-        query_embedding = self.embedder.encode(query).tolist()
-        best_sim = 0.0
-        best_entry = None
-        for i, doc in enumerate(results["documents"]):
-            doc_embedding = self.embedder.encode(doc).tolist()
-            sim = self._cosine_similarity(query_embedding, doc_embedding)
-            if sim > best_sim and sim >= self.valves.duplicate_question_threshold:
-                best_sim = sim
-                best_entry = {
-                    "content": doc,
-                    "sim": sim,
-                    "timestamp": results["metadatas"][0][i].get("timestamp"),
-                }
-        return best_entry
-
-    def _cosine_similarity(self, a, b):
-        dot = sum(x * y for x, y in zip(a, b))
-        norm_a = sum(x * x for x in a) ** 0.5
-        norm_b = sum(y * y for y in b) ** 0.5
-        return dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
-
-    # --------------------------------------------------------------------------
-    # Sugerencias de comandos por contexto (#5)
-    # --------------------------------------------------------------------------
-    async def _suggest_commands(self, project_id: str, state: Dict) -> Optional[str]:
-        if not self.valves.enable_command_suggestions:
-            return None
-        last_suggestion = state.get("last_suggestion_timestamp", 0)
-        if (
-            time.time() - last_suggestion
-            < self.valves.command_suggestion_cooldown_minutes * 60
-        ):
-            return None
-        suggestions = []
-        obsolete_count = sum(1 for b in state["active_blocks"].values() if b.obsolete)
-        if obsolete_count > 3:
-            suggestions.append(
-                "`/forget all` o `/obsolete revive` para gestionar bloques obsoletos."
-            )
-        high_importance_unpinned = [
-            b
-            for b in state["active_blocks"].values()
-            if b.importance_score > 6.0 and not b.pinned
-        ]
-        if len(high_importance_unpinned) > 2:
-            suggestions.append(
-                "`/remember` para anclar bloques importantes y evitar que se resuman o expiren."
-            )
-        if state.get("recent_changes"):
-            suggestions.append(
-                "`/iterate` para aplicar automáticamente los cambios pendientes."
-            )
-        if len(state["active_blocks"]) > 30:
-            suggestions.append(
-                "Considera usar `/summarize` para comprimir conversaciones antiguas (si tienes la funcionalidad)."
-            )
-        if suggestions:
-            state["last_suggestion_timestamp"] = time.time()
-            self._set_state(project_id, state)
-            return "💡 **Tip**: " + " ".join(suggestions)
-        return None
-
-    # --------------------------------------------------------------------------
-    # Resumen de mensajes (ya existente, adaptado)
-    # --------------------------------------------------------------------------
-    async def _summarize_messages(
-        self, messages: List[dict], is_code_context: bool = False
-    ) -> Optional[str]:
-        if not HAS_AIOHTTP or not messages:
-            return None
-
-        content_type_counts = defaultdict(int)
-        for m in messages:
-            content = m.get("content", "")
-            extracted = await self._extract_code_blocks(content)
-            ctype = self._classify_content(content, extracted)
-            content_type_counts[ctype] += 1
-
-        if (
-            self.valves.selective_summarization
-            and self.valves.error_preserve_verbatim
-            and content_type_counts.get(ContentType.ERROR, 0) > 0
-        ):
-            return "\n".join(
-                [f"{m.get('role')}: {m.get('content', '')}" for m in messages]
-            )
-
-        conv_text = "\n".join(
-            f"{m.get('role')}: {m.get('content', '')}" for m in messages
-        )
-        if content_type_counts:
-            dominant_type = max(content_type_counts.items(), key=lambda x: x[1])[0]
-        else:
-            dominant_type = ContentType.GENERAL
-        prompt = self._get_summary_prompt_for_content(
-            dominant_type, conv_text, self.valves.general_summary_max_tokens
-        )
-        model_override = (
-            self.valves.summary_fallback_model
-            if self.valves.summary_fallback_model
-            else None
-        )
-        max_tokens = (
-            self.valves.general_summary_max_tokens
-            if dominant_type == ContentType.GENERAL
-            else 500
-        )
-        summary = await self._call_llm(
-            prompt=prompt,
-            system_prompt="Eres un asistente de resúmenes concisos.",
-            model_override=model_override,
-            max_tokens=max_tokens,
-            temperature=0.3,
-        )
-        if not summary:
-            return None
-        if self.valves.selective_summarization and self.valves.summary_include_metadata:
-            summary = f"[Resumen de {len(messages)} mensajes, tipo: {dominant_type.value}]\n{summary}"
-        return summary
-
-    # --------------------------------------------------------------------------
-    # Duplicación de mensajes consecutivos similares
+    # Consecutive similar message handling (deduplication)
     # --------------------------------------------------------------------------
     async def _summarize_diff_between_messages(self, msg1: dict, msg2: dict) -> str:
         content1 = msg1.get("content", "")
         content2 = msg2.get("content", "")
-        prompt = f"""El usuario envió dos mensajes consecutivos muy similares. El segundo es probablemente una actualización/corrección del primero.
+        prompt = f"""The user sent two consecutive very similar messages. The second is likely an update/correction of the first.
 
-PRIMER MENSAJE:
+FIRST MESSAGE:
 {content1[:1500]}
 
-SEGUNDO MENSAJE (más reciente):
+SECOND MESSAGE (newer):
 {content2[:1500]}
 
-Proporciona un resumen muy conciso (máx. 150 palabras) de lo que cambió entre ellos. Céntrate solo en las diferencias. Si el segundo mensaje reemplaza completamente al primero, di "Versión actualizada" e incluye el contenido nuevo.
+Provide a very concise summary (max 150 words) of what changed between them. Focus only on the differences. If the second message completely replaces the first, just say "Updated version" and include the new content.
 """
         diff_summary = await self._call_llm(
             prompt=prompt,
-            system_prompt="Eres un asistente que resume diferencias entre mensajes similares.",
+            system_prompt="You are a code-aware assistant that summarizes differences between similar messages.",
             max_tokens=300,
             temperature=0.2,
         )
         if not diff_summary:
-            return f"[Versión actualizada]\n{content2}"
-        return f"[Resumen de cambios]\n{diff_summary}\n\n[Versión final]\n{content2}"
+            return f"[Updated version]\n{content2}"
+        return f"[Summary of changes]\n{diff_summary}\n\n[Final version]\n{content2}"
 
     async def _deduplicate_consecutive_messages(
         self, history_msgs: List[dict]
@@ -2035,7 +1922,298 @@ Proporciona un resumen muy conciso (máx. 150 palabras) de lo que cambió entre 
         return new_history
 
     # --------------------------------------------------------------------------
-    # Razonamiento paso a paso (/think)
+    # Obsolete marking
+    # --------------------------------------------------------------------------
+    async def _parse_obsolete_intent(self, user_message: str) -> Optional[Dict]:
+        if not self.valves.enable_obsolete_marking:
+            return None
+        model = (
+            self.valves.natural_language_forget_model
+            or self.valves.llm_model
+            or self.valves.summarization_model
+        )
+        prompt = f"""You are a command interpreter. The user wants to mark some context as obsolete (no longer relevant).
+Possible actions:
+- "obsolete_last": mark the last code block as obsolete.
+- "obsolete_n": mark the last N code blocks as obsolete.
+- "obsolete_file": mark all blocks related to a file as obsolete.
+- "obsolete_block": mark a specific block (by hash, function name, or line range) as obsolete.
+- "obsolete_all": mark all active blocks as obsolete.
+- "revive_last": remove obsolete mark from the last block.
+- "revive_file": remove obsolete mark from blocks related to a file.
+- "revive_all": remove all obsolete marks.
+
+User message: "{user_message}"
+
+If the user clearly wants to mark/unmark as obsolete, output JSON with action and parameters.
+If no obsolete intent, output: {{"action": "none"}}
+
+Examples:
+- "mark this block as obsolete" -> {{"action": "obsolete_last"}}
+- "the last two changes are no longer useful" -> {{"action": "obsolete_n", "n": 2}}
+- "the file utils.py is obsolete" -> {{"action": "obsolete_file", "file": "utils.py"}}
+- "revive the calculate_total function" -> {{"action": "revive_block", "description": "calculate_total"}}
+
+Output only JSON.
+"""
+        response = await self._call_llm(
+            prompt=prompt,
+            system_prompt="You output JSON only.",
+            model_override=model,
+            max_tokens=150,
+            temperature=0.1,
+        )
+        if not response:
+            return None
+        try:
+            response = response.strip()
+            if response.startswith("```json"):
+                response = response[7:]
+            if response.endswith("```"):
+                response = response[:-3]
+            data = json.loads(response)
+            if data.get("action") != "none":
+                self._log_debug(f"Parsed obsolete intent: {data}")
+                return data
+        except:
+            pass
+        return None
+
+    def _set_obsolete_flag(self, blocks: List[CodeBlock], obsolete_value: bool):
+        for blk in blocks:
+            blk.obsolete = obsolete_value
+            blk._update_importance()
+            self._log_debug(f"Marked block {blk.hash} obsolete={obsolete_value}")
+        return len(blocks)
+
+    async def _execute_obsolete_intent(self, project_id: str, intent: Dict) -> str:
+        state = self._get_state(project_id)
+        if not state:
+            return "No active context to mark as obsolete."
+        action = intent.get("action", "")
+        blocks = list(state["active_blocks"].values())
+        if not blocks:
+            return "No blocks available."
+        if action == "obsolete_last":
+            last_block = max(blocks, key=lambda b: b.timestamp)
+            self._set_obsolete_flag([last_block], True)
+            return "Marked last code block as obsolete."
+        elif action == "obsolete_n":
+            n = intent.get("n", 1)
+            blocks_by_time = sorted(blocks, key=lambda b: b.timestamp, reverse=True)
+            to_obsolete = blocks_by_time[:n]
+            count = self._set_obsolete_flag(to_obsolete, True)
+            return f"Marked {count} block(s) as obsolete."
+        elif action == "obsolete_file":
+            file_path = intent.get("file", "")
+            if not file_path:
+                return "No file specified."
+            to_obsolete = [
+                blk for blk in blocks if blk.file_path and file_path in blk.file_path
+            ]
+            count = self._set_obsolete_flag(to_obsolete, True)
+            return f"Marked {count} block(s) related to {file_path} as obsolete."
+        elif action == "obsolete_block":
+            desc = intent.get("description", "") or intent.get("hash", "")
+            if not desc:
+                return "No block identifier."
+            matches = [
+                blk
+                for blk in blocks
+                if desc in blk.content
+                or (blk.hash and desc in blk.hash)
+                or (blk.file_path and desc in blk.file_path)
+            ]
+            count = self._set_obsolete_flag(matches, True)
+            return f"Marked {count} block(s) matching '{desc}' as obsolete."
+        elif action == "obsolete_all":
+            count = self._set_obsolete_flag(blocks, True)
+            return f"Marked all {count} block(s) as obsolete."
+        elif action == "revive_last":
+            last_block = max(blocks, key=lambda b: b.timestamp)
+            self._set_obsolete_flag([last_block], False)
+            return "Removed obsolete mark from last block."
+        elif action == "revive_file":
+            file_path = intent.get("file", "")
+            if not file_path:
+                return "No file specified."
+            to_revive = [
+                blk for blk in blocks if blk.file_path and file_path in blk.file_path
+            ]
+            count = self._set_obsolete_flag(to_revive, False)
+            return (
+                f"Removed obsolete mark from {count} block(s) related to {file_path}."
+            )
+        elif action == "revive_all":
+            count = self._set_obsolete_flag(blocks, False)
+            return f"Removed obsolete mark from all {count} block(s)."
+        else:
+            return "Unrecognized obsolete action."
+
+    # --------------------------------------------------------------------------
+    # Proactive summarization suggestion
+    # --------------------------------------------------------------------------
+    async def _check_and_suggest_summarization(
+        self, project_id: str, current_tokens: int, max_tokens: int
+    ) -> Optional[str]:
+        if not self.valves.proactive_summary_threshold or max_tokens <= 0:
+            return None
+        usage_ratio = current_tokens / max_tokens
+        if usage_ratio < self.valves.proactive_summary_threshold:
+            return None
+        state = self._get_state(project_id)
+        if not state:
+            return None
+        obsolete_count = sum(1 for b in state["active_blocks"].values() if b.obsolete)
+        inactive_count = sum(
+            1
+            for b in state["active_blocks"].values()
+            if not b.is_active and not b.obsolete
+        )
+        suggestion_parts = []
+        if obsolete_count > 2:
+            suggestion_parts.append(
+                f"- You have {obsolete_count} obsolete block(s). Use `/obsolete revive` if needed, or they will be ignored."
+            )
+        if inactive_count > 5:
+            suggestion_parts.append(
+                f"- There are {inactive_count} inactive code blocks. Use `/forget` to remove them or `/remember` to pin important ones."
+            )
+        if not suggestion_parts:
+            suggestion_parts.append(
+                f"- Context is at {int(usage_ratio*100)}% capacity. Consider summarizing old conversations with `/summarize` or using `/forget` to free space."
+            )
+        return "⚠️ **Context nearly full**\n" + "\n".join(suggestion_parts)
+
+    # --------------------------------------------------------------------------
+    # Duplicate question detection
+    # --------------------------------------------------------------------------
+    async def _find_duplicate_question(
+        self, query: str, project_id: str
+    ) -> Optional[Dict]:
+        if not self.valves.duplicate_question_threshold or not HAS_SENTENCE:
+            return None
+        results = self.memory_collection.get(
+            where={"project_id": project_id, "role": "user"},
+            limit=self.valves.duplicate_question_lookback,
+            include=["documents", "metadatas"],
+        )
+        if not results or not results["documents"]:
+            return None
+        query_embedding = self.embedder.encode(query).tolist()
+        best_sim = 0.0
+        best_entry = None
+        for i, doc in enumerate(results["documents"]):
+            doc_embedding = self.embedder.encode(doc).tolist()
+            sim = self._cosine_similarity(query_embedding, doc_embedding)
+            if sim > best_sim and sim >= self.valves.duplicate_question_threshold:
+                best_sim = sim
+                best_entry = {
+                    "content": doc,
+                    "sim": sim,
+                    "timestamp": results["metadatas"][0][i].get("timestamp"),
+                }
+        return best_entry
+
+    # --------------------------------------------------------------------------
+    # Context-aware command suggestions
+    # --------------------------------------------------------------------------
+    async def _suggest_commands(self, project_id: str, state: Dict) -> Optional[str]:
+        if not self.valves.enable_command_suggestions:
+            return None
+        last_suggestion = state.get("last_suggestion_timestamp", 0)
+        if (
+            time.time() - last_suggestion
+            < self.valves.command_suggestion_cooldown_minutes * 60
+        ):
+            return None
+        suggestions = []
+        obsolete_count = sum(1 for b in state["active_blocks"].values() if b.obsolete)
+        if obsolete_count > 3:
+            suggestions.append(
+                "`/forget all` or `/obsolete revive` to manage obsolete blocks."
+            )
+        high_importance_unpinned = [
+            b
+            for b in state["active_blocks"].values()
+            if b.importance_score > 6.0 and not b.pinned
+        ]
+        if len(high_importance_unpinned) > 2:
+            suggestions.append(
+                "`/remember` to pin important blocks and prevent them from being summarized or expired."
+            )
+        if state.get("recent_changes"):
+            suggestions.append("`/iterate` to apply pending changes automatically.")
+        if len(state["active_blocks"]) > 30:
+            suggestions.append(
+                "Consider using `/summarize` to compress old conversations (if you have that feature)."
+            )
+        if suggestions:
+            state["last_suggestion_timestamp"] = time.time()
+            self._set_state(project_id, state)
+            return "💡 **Tip**: " + " ".join(suggestions)
+        return None
+
+    # --------------------------------------------------------------------------
+    # Message summarization (selective)
+    # --------------------------------------------------------------------------
+    async def _summarize_messages(
+        self, messages: List[dict], is_code_context: bool = False
+    ) -> Optional[str]:
+        if not HAS_AIOHTTP or not messages:
+            return None
+
+        content_type_counts = defaultdict(int)
+        for m in messages:
+            content = m.get("content", "")
+            extracted = await self._extract_code_blocks(content)
+            ctype = self._classify_content(content, extracted)
+            content_type_counts[ctype] += 1
+
+        if (
+            self.valves.selective_summarization
+            and self.valves.error_preserve_verbatim
+            and content_type_counts.get(ContentType.ERROR, 0) > 0
+        ):
+            return "\n".join(
+                [f"{m.get('role')}: {m.get('content', '')}" for m in messages]
+            )
+
+        conv_text = "\n".join(
+            f"{m.get('role')}: {m.get('content', '')}" for m in messages
+        )
+        if content_type_counts:
+            dominant_type = max(content_type_counts.items(), key=lambda x: x[1])[0]
+        else:
+            dominant_type = ContentType.GENERAL
+        prompt = self._get_summary_prompt_for_content(
+            dominant_type, conv_text, self.valves.general_summary_max_tokens
+        )
+        model_override = (
+            self.valves.summary_fallback_model
+            if self.valves.summary_fallback_model
+            else None
+        )
+        max_tokens = (
+            self.valves.general_summary_max_tokens
+            if dominant_type == ContentType.GENERAL
+            else 500
+        )
+        summary = await self._call_llm(
+            prompt=prompt,
+            system_prompt="You are a code-aware assistant that produces concise, information-dense summaries.",
+            model_override=model_override,
+            max_tokens=max_tokens,
+            temperature=0.3,
+        )
+        if not summary:
+            return None
+        if self.valves.selective_summarization and self.valves.summary_include_metadata:
+            summary = f"[Summary of {len(messages)} messages, type: {dominant_type.value}]\n{summary}"
+        return summary
+
+    # --------------------------------------------------------------------------
+    # Chain-of-Thought reasoning (/think)
     # --------------------------------------------------------------------------
     async def _parse_cot_intent(self, user_message: str) -> Optional[str]:
         if not self.valves.enable_cot_on_demand:
@@ -2044,11 +2222,9 @@ Proporciona un resumen muy conciso (máx. 150 palabras) de lo que cambió entre 
             parts = user_message.split(maxsplit=1)
             if len(parts) > 1:
                 return parts[1]
-            return "¿Sobre qué te gustaría que piense paso a paso?"
+            return "What would you like me to think step by step about?"
         if re.search(
-            r"\b(think step by step|razona paso a paso|piensa paso a paso)\b",
-            user_message,
-            re.IGNORECASE,
+            r"\b(think step by step|reason step by step)\b", user_message, re.IGNORECASE
         ):
             return user_message
         return None
@@ -2059,26 +2235,26 @@ Proporciona un resumen muy conciso (máx. 150 palabras) de lo que cambió entre 
             or self.valves.llm_model
             or self.valves.summarization_model
         )
-        prompt = f"""Eres un asistente que razona paso a paso. Por favor, piensa paso a paso para responder la siguiente pregunta. Muestra tu razonamiento claramente, luego proporciona una respuesta final.
+        prompt = f"""You are a reasoning assistant. Please think step by step to answer the following question. Show your reasoning clearly, then provide a final answer.
 
-Contexto:
+Context:
 {context[:2000]}
 
-Pregunta: {question}
+Question: {question}
 
-Procede paso a paso.
+Proceed step by step.
 """
         response = await self._call_llm(
             prompt=prompt,
-            system_prompt="Eres un razonador meticuloso. Genera primero el razonamiento paso a paso, luego la respuesta final.",
+            system_prompt="You are a meticulous reasoner. Output step-by-step reasoning, then a final answer.",
             model_override=model,
             max_tokens=self.valves.cot_max_tokens,
             temperature=0.3,
         )
-        return response or "No se pudo generar el razonamiento."
+        return response or "Could not generate reasoning."
 
     # --------------------------------------------------------------------------
-    # Extracción de supuestos (/assume)
+    # Assumption extraction (/assume)
     # --------------------------------------------------------------------------
     async def _parse_assumption_intent(self, user_message: str) -> Optional[str]:
         if not self.valves.enable_assumption_extraction:
@@ -2089,7 +2265,7 @@ Procede paso a paso.
                 return parts[1]
             return None
         if re.search(
-            r"\b(qué supuestos|qué asunciones|underlying assumptions)\b",
+            r"\b(what assumptions|underlying assumptions)\b",
             user_message,
             re.IGNORECASE,
         ):
@@ -2102,24 +2278,24 @@ Procede paso a paso.
             or self.valves.llm_model
             or self.valves.summarization_model
         )
-        prompt = f"""Analiza la siguiente declaración o código y extrae los supuestos subyacentes. Enumera claramente cada supuesto. También señala premisas implícitas o sesgos.
+        prompt = f"""Analyze the following statement or code and extract the underlying assumptions. List each assumption clearly. Also note any unstated premises or biases.
 
-Declaración/Código:
+Statement/Code:
 {text[:2000]}
 
-Da como resultado una lista estructurada de supuestos y un breve comentario sobre su validez o impacto.
+Output a structured list of assumptions and a brief comment on their validity or impact.
 """
         response = await self._call_llm(
             prompt=prompt,
-            system_prompt="Eres un asistente analítico que extrae supuestos ocultos.",
+            system_prompt="You are an analytical assistant that extracts hidden assumptions.",
             model_override=model,
             max_tokens=800,
             temperature=0.2,
         )
-        return response or "No se pudieron extraer supuestos."
+        return response or "Could not extract assumptions."
 
     # --------------------------------------------------------------------------
-    # Detección de contradicciones
+    # Contradiction detection
     # --------------------------------------------------------------------------
     async def _detect_contradictions(
         self, conversation_messages: List[dict]
@@ -2138,22 +2314,22 @@ Da como resultado una lista estructurada de supuestos y un breve comentario sobr
         conv_text = "\n".join(
             [f"{m.get('role')}: {m.get('content', '')[:500]}" for m in recent]
         )
-        prompt = f"""Analiza la siguiente conversación en busca de contradicciones. Busca afirmaciones que entren en conflicto entre sí, como:
-- El usuario dice A y luego dice no A
-- El asistente proporciona información inconsistente
-- Requisitos de código que se contradicen
+        prompt = f"""Analyze the following conversation for contradictions. Look for statements that conflict with each other, such as:
+- User says A and later says not A
+- Assistant provides inconsistent information
+- Code requirements that contradict
 
-Si encuentras una contradicción, genera un JSON con "contradiction": true, "explanation": "..." y "suggestion": "...".
-Si no hay contradicción, genera {{"contradiction": false}}.
+If you find a contradiction, output JSON: {{"contradiction": true, "explanation": "...", "suggestion": "..."}}
+If no contradiction, output {{"contradiction": false}}.
 
-Conversación:
+Conversation:
 {conv_text}
 
-Devuelve solo JSON.
+Output only JSON.
 """
         response = await self._call_llm(
             prompt=prompt,
-            system_prompt="Eres un asistente detector de contradicciones. Devuelves solo JSON.",
+            system_prompt="You are a contradiction detection assistant. Output JSON only.",
             model_override=model,
             max_tokens=300,
             temperature=0.1,
@@ -2168,13 +2344,13 @@ Devuelve solo JSON.
                 response = response[:-3]
             data = json.loads(response)
             if data.get("contradiction"):
-                return f"⚠️ **Contradicción detectada**: {data.get('explanation', '')}\n\nSugerencia: {data.get('suggestion', '')}"
+                return f"⚠️ **Contradiction detected**: {data.get('explanation', '')}\n\nSuggestion: {data.get('suggestion', '')}"
         except:
             pass
         return None
 
     # --------------------------------------------------------------------------
-    # Comandos de olvido (forget)
+    # Forget commands (natural language)
     # --------------------------------------------------------------------------
     async def _parse_forget_intent(self, user_message: str) -> Optional[Dict]:
         if not self.valves.enable_natural_language_forget:
@@ -2184,14 +2360,14 @@ Devuelve solo JSON.
             or self.valves.llm_model
             or self.valves.summarization_model
         )
-        prompt = f"""Interpreta la intención de olvido. Acciones posibles: forget_last, forget_n (con n), forget_file (con file), forget_block (con hash), forget_all.
-Mensaje: "{user_message}"
-Salida JSON: {{"action": "...", "n": N, "file": "...", "hash": "..."}} o {{"action": "none"}}
-Solo JSON.
+        prompt = f"""Interpret forget intent. Possible actions: forget_last, forget_n (with n), forget_file (with file), forget_block (with hash), forget_all.
+User: "{user_message}"
+Output JSON: {{"action": "...", "n": N, "file": "...", "hash": "..."}} or {{"action": "none"}}
+Output only JSON.
 """
         response = await self._call_llm(
             prompt=prompt,
-            system_prompt="Solo JSON.",
+            system_prompt="You output JSON only.",
             model_override=model,
             max_tokens=150,
             temperature=0.1,
@@ -2206,7 +2382,7 @@ Solo JSON.
                 response = response[:-3]
             data = json.loads(response)
             if data.get("action") != "none":
-                self._log_debug(f"Intención de olvido interpretada: {data}")
+                self._log_debug(f"Parsed forget intent: {data}")
                 return data
         except:
             pass
@@ -2215,7 +2391,7 @@ Solo JSON.
     async def _execute_forget_intent(self, project_id: str, intent: Dict) -> str:
         state = self._get_state(project_id)
         if not state:
-            return "No hay contexto activo para olvidar."
+            return "No active context to forget."
         action = intent.get("action")
         if action == "forget_last":
             if state["active_blocks"]:
@@ -2224,8 +2400,8 @@ Solo JSON.
                     key=lambda h: state["active_blocks"][h].timestamp,
                 )
                 del state["active_blocks"][last_hash]
-                self._log_debug(f"Olvidado último bloque: {last_hash}")
-            return "Olvidado el último bloque de contexto."
+                self._log_debug(f"Forget last: removed block {last_hash}")
+            return "Forgotten the last context block."
         elif action == "forget_n":
             n = intent.get("n", 1)
             blocks_by_time = sorted(
@@ -2238,11 +2414,11 @@ Solo JSON.
                 if h in state["active_blocks"]:
                     del state["active_blocks"][h]
                     removed += 1
-            return f"Olvidados los últimos {removed} bloques de contexto."
+            return f"Forgotten the last {removed} context block(s)."
         elif action == "forget_file":
             file_path = intent.get("file", "")
             if not file_path:
-                return "No se especificó archivo."
+                return "No file specified."
             to_remove = [
                 h
                 for h, blk in state["active_blocks"].items()
@@ -2250,27 +2426,27 @@ Solo JSON.
             ]
             for h in to_remove:
                 del state["active_blocks"][h]
-            return f"Olvidados {len(to_remove)} bloques relacionados con {file_path}."
+            return f"Forgotten {len(to_remove)} block(s) related to {file_path}."
         elif action == "forget_block":
             block_id = intent.get("hash") or intent.get("id") or ""
             if not block_id:
-                return "No se especificó bloque."
+                return "No block specified."
             if block_id in state["active_blocks"]:
                 del state["active_blocks"][block_id]
-                return f"Olvidado bloque {block_id}."
+                return f"Forgotten block {block_id}."
             matches = [h for h in state["active_blocks"] if block_id in h]
             if matches:
                 for h in matches:
                     del state["active_blocks"][h]
-                return f"Olvidados {len(matches)} bloques que coinciden con {block_id}."
-            return f"No se encontró bloque {block_id}."
+                return f"Forgotten {len(matches)} block(s) matching {block_id}."
+            return f"No block found for {block_id}."
         elif action == "forget_all":
             state["active_blocks"].clear()
             state["recent_changes"].clear()
             state["committed_changes"].clear()
-            return "Olvidado todo el contexto."
+            return "Forgotten all context."
         else:
-            return "Intención de olvido no reconocida."
+            return "Unrecognized forget action."
 
     async def _handle_forget_command(
         self, messages: List[dict], project_id: str, __user__: Optional[dict]
@@ -2306,7 +2482,7 @@ Solo JSON.
                 state["active_blocks"].clear()
                 state["recent_changes"].clear()
                 state["committed_changes"].clear()
-                confirmation = "Olvidado todo el contexto."
+                confirmation = "Forgotten all context."
             elif target == "last":
                 if state["active_blocks"]:
                     last_hash = max(
@@ -2314,9 +2490,9 @@ Solo JSON.
                         key=lambda h: state["active_blocks"][h].timestamp,
                     )
                     del state["active_blocks"][last_hash]
-                    confirmation = "Olvidado el último bloque de contexto."
+                    confirmation = "Forgotten the last context block."
                 else:
-                    confirmation = "No hay bloques para olvidar."
+                    confirmation = "No blocks to forget."
             else:
                 to_remove = [
                     h
@@ -2326,7 +2502,7 @@ Solo JSON.
                 for h in to_remove:
                     del state["active_blocks"][h]
                 confirmation = (
-                    f"Olvidados {len(to_remove)} bloques que coinciden con '{target}'."
+                    f"Forgotten {len(to_remove)} block(s) matching '{target}'."
                 )
             self._set_state(project_id, state)
             messages.pop()
@@ -2336,7 +2512,7 @@ Solo JSON.
         return messages, False
 
     # --------------------------------------------------------------------------
-    # Recordar / anclar (pin) con lenguaje natural
+    # Remember (pin) commands
     # --------------------------------------------------------------------------
     async def _parse_remember_intent(self, user_message: str) -> Optional[Dict]:
         if not self.valves.enable_natural_language_forget:
@@ -2346,15 +2522,15 @@ Solo JSON.
             or self.valves.llm_model
             or self.valves.summarization_model
         )
-        prompt = f"""Eres un intérprete de comandos. El usuario quiere anclar o recordar contexto.
-Acciones posibles: pin_last, pin_n (con n), pin_file (con file), pin_block (con description), pin_all, unpin_last, unpin_file, unpin_all, etc.
-Mensaje: "{user_message}"
-Salida JSON con acción y parámetros. Si no es intención de recordar: {{"action": "none"}}
-Solo JSON.
+        prompt = f"""You are a command interpreter. The user wants to pin or remember some context.
+Possible actions: pin_last, pin_n (with n), pin_file (with file), pin_block (with description), pin_all, unpin_last, unpin_file, unpin_all, etc.
+User: "{user_message}"
+Output JSON with action and parameters. If no pinning intent: {{"action": "none"}}
+Output only JSON.
 """
         response = await self._call_llm(
             prompt=prompt,
-            system_prompt="Solo JSON.",
+            system_prompt="You output JSON only.",
             model_override=model,
             max_tokens=150,
             temperature=0.1,
@@ -2369,7 +2545,7 @@ Solo JSON.
                 response = response[:-3]
             data = json.loads(response)
             if data.get("action") != "none":
-                self._log_debug(f"Intención de recordar interpretada: {data}")
+                self._log_debug(f"Parsed remember intent: {data}")
                 return data
         except:
             pass
@@ -2378,7 +2554,7 @@ Solo JSON.
     async def _execute_remember_intent(self, project_id: str, intent: Dict) -> str:
         state = self._get_state(project_id)
         if not state:
-            return "No hay contexto activo para anclar."
+            return "No active context to pin."
 
         def set_pinned(blocks, pinned_value):
             count = 0
@@ -2394,31 +2570,31 @@ Solo JSON.
         action = intent.get("action", "")
         blocks = list(state["active_blocks"].values())
         if not blocks:
-            return "No hay bloques disponibles."
+            return "No blocks available."
 
         if action == "pin_last":
             last_block = max(blocks, key=lambda b: b.timestamp)
             set_pinned([last_block], True)
-            return "Anclado el último bloque de código."
+            return "Pinned last code block."
         elif action == "pin_n":
             n = intent.get("n", 1)
             blocks_by_time = sorted(blocks, key=lambda b: b.timestamp, reverse=True)
             to_pin = blocks_by_time[:n]
             count = set_pinned(to_pin, True)
-            return f"Anclados {count} bloque(s)."
+            return f"Pinned {count} block(s)."
         elif action == "pin_file":
             file_path = intent.get("file", "")
             if not file_path:
-                return "No se especificó archivo."
+                return "No file specified."
             to_pin = [
                 blk for blk in blocks if blk.file_path and file_path in blk.file_path
             ]
             count = set_pinned(to_pin, True)
-            return f"Anclados {count} bloque(s) relacionados con {file_path}."
+            return f"Pinned {count} block(s) related to {file_path}."
         elif action == "pin_block":
             desc = intent.get("description", "") or intent.get("hash", "")
             if not desc:
-                return "No se especificó identificador."
+                return "No block identifier."
             matches = [
                 blk
                 for blk in blocks
@@ -2427,31 +2603,31 @@ Solo JSON.
                 or (blk.file_path and desc in blk.file_path)
             ]
             count = set_pinned(matches, True)
-            return f"Anclados {count} bloque(s) que coinciden con '{desc}'."
+            return f"Pinned {count} block(s) matching '{desc}'."
         elif action == "pin_all":
             count = set_pinned(blocks, True)
-            return f"Anclados todos los {count} bloque(s) activos."
+            return f"Pinned all {count} active blocks."
         elif action == "unpin_last":
             last_block = max(blocks, key=lambda b: b.timestamp)
             set_pinned([last_block], False)
-            return "Desanclado el último bloque."
+            return "Unpinned last block."
         elif action == "unpin_file":
             file_path = intent.get("file", "")
             if not file_path:
-                return "No se especificó archivo."
+                return "No file specified."
             to_unpin = [
                 blk for blk in blocks if blk.file_path and file_path in blk.file_path
             ]
             count = set_pinned(to_unpin, False)
-            return f"Desanclados {count} bloque(s) relacionados con {file_path}."
+            return f"Unpinned {count} block(s) related to {file_path}."
         elif action == "unpin_all":
             count = set_pinned(blocks, False)
-            return f"Desanclados todos los {count} bloque(s)."
+            return f"Unpinned all {count} blocks."
         else:
-            return "Acción de anclaje no reconocida."
+            return "Unrecognized pin action."
 
     # --------------------------------------------------------------------------
-    # Iteración (/iterate) - planificación y ejecución
+    # Iterative task execution (/iterate)
     # --------------------------------------------------------------------------
     async def _generate_plan(self, goal: str, context: str) -> List[Dict]:
         model = (
@@ -2459,33 +2635,33 @@ Solo JSON.
             or self.valves.llm_model
             or self.valves.summarization_model
         )
-        prompt = f"""Eres un experto desarrollador Python. El usuario quiere realizar la siguiente tarea:
+        prompt = f"""You are an expert Python developer. The user wants to perform the following task:
 
 {goal}
 
-Contexto actual (archivos, funciones, etc.):
+Current context (relevant files, functions, etc.):
 {context[:3000]}
 
-Descompón la tarea en una secuencia de pasos concretos. Cada paso debe ser un cambio pequeño y accionable que pueda implementarse como un diff unificado (parche) sobre el código.
-Devuelve un array JSON de pasos, cada paso con:
-- "description": descripción corta de lo que hace el paso
-- "file": la ruta del archivo a modificar (si se conoce, si no "unknown")
-- "changes": un resumen breve de los cambios (se usará para generar el diff después)
+Break down the task into a sequence of concrete steps. Each step should be a small, actionable change that can be implemented as a unified diff (patch) to the codebase.
+Output a JSON array of steps, each with:
+- "description": a short description of what the step does
+- "file": the file path to modify (if known, otherwise "unknown")
+- "changes": a brief summary of the changes (will be used to generate the diff later)
 
-Ejemplo:
+Example:
 [
   {{
-    "description": "Añadir función calculate_average",
+    "description": "Add function calculate_average",
     "file": "utils/math.py",
-    "changes": "Añadir función que toma una lista y devuelve la media"
+    "changes": "Add function that takes a list and returns average"
   }}
 ]
 
-El plan debe tener como máximo {self.valves.iterative_max_steps} pasos. Devuelve solo JSON, sin texto extra.
+The plan must have at most {self.valves.iterative_max_steps} steps. Output only JSON, no extra text.
 """
         response = await self._call_llm(
             prompt=prompt,
-            system_prompt="Eres un planificador preciso. Solo JSON.",
+            system_prompt="You are a precise task planner. Output only JSON.",
             model_override=model,
             max_tokens=1500,
             temperature=0.2,
@@ -2519,37 +2695,37 @@ El plan debe tener como máximo {self.valves.iterative_max_steps} pasos. Devuelv
                 if b.content_type == ContentType.BASE_CODE
             ]
         )
-        prompt = f"""Genera un diff unificado (parche) para implementar un cambio específico.
+        prompt = f"""You are generating a unified diff (patch) to implement a specific change.
 
-Archivo a modificar: {step.get('file', 'unknown')}
-Descripción del cambio: {step.get('changes', '')}
-Objetivo: {step.get('description', '')}
+File to modify: {step.get('file', 'unknown')}
+Change description: {step.get('changes', '')}
+Goal: {step.get('description', '')}
 
-Código relevante actual (puede incluir varios archivos):
+Current relevant code (may include multiple files):
 {active_code[:3000]}
 
-Genera un diff unificado que aplique este cambio. Usa el formato:
+Generate a unified diff that applies this change. Use the format:
 
 ```diff
 --- a/file.py
 +++ b/file.py
 @@ -line,old +line,new @@
- -línea antigua
- +línea nueva
- ```
- Si el archivo no existe en el contexto proporcionado, supón que es un archivo nuevo y crea un diff desde vacío (ej. usa /dev/null como original).
-Devuelve solo el diff, encerrado entre `diff ...` .
+ -old line
+ +new line
+ ``
+ If the file doesn't exist in the provided context, assume it is a new file and create a diff from empty (e.g., use /dev/null as original).
+Output only the diff, enclosed in diff ... .
 """
 
         response = await self._call_llm(
             prompt=prompt,
-            system_prompt="Generas diffs unificados correctos. Solo el diff con formato.",
+            system_prompt="You are a code assistant that generates correct unified diffs. Output only the diff with proper formatting.",
             model_override=model,
             max_tokens=2000,
             temperature=0.2,
         )
         if not response:
-            return f"# Fallo al generar diff para el paso: {step.get('description')}"
+            return f"# Failed to generate diff for step: {step.get('description')}"
         diff_match = re.search(r"```diff\n(.*?)\n```", response, re.DOTALL)
         if diff_match:
             return diff_match.group(1).strip()
@@ -2563,7 +2739,7 @@ Devuelve solo el diff, encerrado entre `diff ...` .
         state = self._get_state(project_id)
         active_ctx = self._get_active_code_context(project_id)
         facts_ctx = self._get_facts_context(project_id)
-        context = f"Código activo:\n{active_ctx}\n\nHechos:\n{facts_ctx}"
+        context = f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
         plan = await self._generate_plan(goal, context)
         if not plan:
             return False
@@ -2576,27 +2752,25 @@ Devuelve solo el diff, encerrado entre `diff ...` .
             "created_at": time.time(),
         }
         self._set_state(project_id, state)
-        self._log_debug(
-            f"Iniciada iteración para objetivo: {goal} con {len(plan)} pasos"
-        )
+        self._log_debug(f"Started iteration for goal: {goal} with {len(plan)} steps")
         return True
 
     async def _execute_next_step(self, project_id: str) -> str:
         state = self._get_state(project_id)
         iter_state = state.get("iterative_state")
         if not iter_state:
-            return "No hay ninguna iteración en curso. Usa `/iterate <objetivo>` para iniciar una tarea."
+            return "No iteration in progress. Use `/iterate <goal>` to start a task."
         plan = iter_state["plan"]
         step_idx = iter_state["current_step"]
         if step_idx >= len(plan):
             state["iterative_state"] = None
             self._set_state(project_id, state)
-            return f"✅ **Todos los pasos completados!**\n\nObjetivo: {iter_state['goal']}\nYa puedes aplicar los diffs manualmente. Usa `/iterate` para iniciar una nueva tarea."
+            return f"✅ **All steps completed!**\n\nGoal: {iter_state['goal']}\nYou can now apply the diffs manually. Use `/iterate` to start a new task."
 
         step = plan[step_idx]
-        pre_reflection = f"**Paso {step_idx+1}/{len(plan)}: {step.get('description')}**\n- Archivo: {step.get('file', 'unknown')}\n- Cambios: {step.get('changes', '')}"
+        pre_reflection = f"**Step {step_idx+1}/{len(plan)}: {step.get('description')}**\n- File: {step.get('file', 'unknown')}\n- Changes: {step.get('changes', '')}"
         diff = await self._generate_diff_for_step(step, project_id)
-        post_reflection = f"\n**Diff generado**\n```diff\n{diff[:1000]}\n```"
+        post_reflection = f"\n**Generated diff**\n```diff\n{diff[:1000]}\n```"
         full_output = pre_reflection + post_reflection
 
         iter_state["results"].append((step_idx, diff, full_output))
@@ -2613,7 +2787,7 @@ Devuelve solo el diff, encerrado entre `diff ...` .
         else:
             return (
                 full_output
-                + "\n\n---\nResponde con **next** / **siguiente** para continuar."
+                + "\n\n---\nRespond with **next** / **siguiente** to continue."
             )
 
     async def _run_iteration(self, project_id: str, command: str) -> Tuple[str, bool]:
@@ -2625,34 +2799,34 @@ Devuelve solo el diff, encerrado entre `diff ...` .
             parts = command.split(maxsplit=1)
             if len(parts) == 1:
                 return (
-                    "**Comandos iterativos:**\n- `/iterate <objetivo>` – iniciar un plan de varios pasos.\n- `/iterate --auto <objetivo>` – ejecutar todos los pasos automáticamente.\n- `/iterate resume` – reanudar una iteración interrumpida.\n- También puedes usar lenguaje natural: 'implementa todas las características paso a paso'.",
+                    "**Iterative commands:**\n- `/iterate <goal>` – start a multi-step plan.\n- `/iterate --auto <goal>` – run all steps automatically.\n- `/iterate resume` – resume an interrupted iteration.\n- You can also use natural language: 'implement all features step by step'.",
                     True,
                 )
             action = parts[1].lower()
             if action == "resume":
                 if not current_iter:
                     return (
-                        "No hay iteración en curso. Inicia una con `/iterate <objetivo>`.",
+                        "No iteration in progress. Start one with `/iterate <goal>`.",
                         True,
                     )
                 return await self._execute_next_step(project_id), True
             elif action.startswith("--auto"):
                 goal = " ".join(parts[1:]).replace("--auto", "").strip()
                 if not goal:
-                    return "Debes especificar un objetivo para la iteración.", True
+                    return "You must specify a goal for the iteration.", True
                 if await self._start_new_iteration(
                     project_id, goal, auto_continue=True
                 ):
                     return await self._execute_next_step(project_id), True
-                return "Fallo al iniciar la iteración.", True
+                return "Failed to start iteration.", True
             else:
                 goal = parts[1]
                 if await self._start_new_iteration(
                     project_id, goal, auto_continue=False
                 ):
                     return await self._execute_next_step(project_id), True
-                return "Fallo al iniciar la iteración.", True
-        # Lenguaje natural para continuar
+                return "Failed to start iteration.", True
+        # Natural language continuation
         if current_iter and command.lower() in [
             "siguiente",
             "continue",
@@ -2660,12 +2834,12 @@ Devuelve solo el diff, encerrado entre `diff ...` .
             "yes",
             "si",
             "ok",
-            "aplicar",
+            "apply",
         ]:
             return await self._execute_next_step(project_id), True
-        # Lenguaje natural para iniciar iteración (detección simple)
+        # Natural language start
         if re.search(
-            r"\b(implementa|haz|ejecuta) (todas|paso a paso|iterativamente)\b",
+            r"\b(implement|do|execute) (all|step by step|iteratively)\b",
             command,
             re.IGNORECASE,
         ):
@@ -2675,7 +2849,7 @@ Devuelve solo el diff, encerrado entre `diff ...` .
         return "", False
 
     # --------------------------------------------------------------------------
-    # LTM retrieval (para selección inteligente y contexto)
+    # LTM retrieval for smart context selection
     # --------------------------------------------------------------------------
     async def _retrieve_historical_messages(
         self, query: str, project_id: str, limit: int
@@ -2725,7 +2899,7 @@ Devuelve solo el diff, encerrado entre `diff ...` .
                 messages = [doc_to_msg[doc] for doc in reranked if doc in doc_to_msg]
             return messages[:limit]
         except Exception as e:
-            logger.warning(f"Fallo recuperación de mensajes históricos: {e}")
+            logger.warning(f"Historical message retrieval failed: {e}")
             return []
 
     async def _retrieve_relevant_memories(
@@ -2783,11 +2957,11 @@ Devuelve solo el diff, encerrado entre `diff ...` .
                 retrieved = retrieved[: self.valves.long_term_memory_top_k]
             return retrieved
         except Exception as e:
-            logger.warning(f"Fallo en recuperación de memorias: {e}")
+            logger.warning(f"Memory retrieval failed: {e}")
             return []
 
     # --------------------------------------------------------------------------
-    # Almacenamiento en LTM
+    # LTM storage
     # --------------------------------------------------------------------------
     def _store_message_in_memory(self, message: dict, project_id: str):
         if not HAS_SENTENCE or not HAS_CHROMA or self.memory_collection is None:
@@ -2823,7 +2997,7 @@ Devuelve solo el diff, encerrado entre `diff ...` .
             ],
             documents=[content],
         )
-        self._log_debug(f"Mensaje almacenado en LTM: {msg_id}")
+        self._log_debug(f"Stored message {msg_id} in LTM")
 
         state = self._get_state(project_id)
         msg_count = state.get("message_count", 0)
@@ -2850,10 +3024,10 @@ Devuelve solo el diff, encerrado entre `diff ...` .
             if len(to_compress) < 2:
                 return
             texts = "\n---\n".join([doc for _, doc, _ in to_compress])
-            prompt = f"Resume el siguiente segmento de conversación, manteniendo las decisiones técnicas clave y los cambios de código:\n\n{texts[:3000]}"
+            prompt = f"Summarise the following conversation segment, keeping key technical decisions and code changes:\n\n{texts[:3000]}"
             summary = await self._call_llm(
                 prompt=prompt,
-                system_prompt="Eres un asistente que produce resúmenes concisos y densos en información.",
+                system_prompt="You produce concise, information-dense summaries.",
                 max_tokens=500,
                 temperature=0.3,
             )
@@ -2874,13 +3048,13 @@ Devuelve solo el diff, encerrado entre `diff ...` .
                     documents=[summary],
                 )
                 self._log_debug(
-                    f"Comprimidos {len(to_compress)} mensajes en resumen para {project_id}"
+                    f"Compressed {len(to_compress)} messages into summary for {project_id}"
                 )
         except Exception as e:
-            logger.warning(f"Fallo en compresión LTM: {e}")
+            logger.warning(f"LTM compression failed: {e}")
 
     # --------------------------------------------------------------------------
-    # Feedback
+    # Feedback handling
     # --------------------------------------------------------------------------
     async def _parse_feedback_intent(self, user_message: str) -> Optional[Dict]:
         if not self.valves.enable_feedback_tracking:
@@ -2890,22 +3064,22 @@ Devuelve solo el diff, encerrado entre `diff ...` .
             or self.valves.llm_model
             or self.valves.summarization_model
         )
-        prompt = f"""Eres un intérprete de retroalimentación. El usuario está dando feedback sobre un cambio aplicado.
-Resultados posibles:
-- success: el cambio funcionó, problema resuelto
-- failure: el cambio no funcionó, el error persiste
-- neutral: no está claro o no es feedback.
+        prompt = f"""You are a feedback interpreter. The user is giving feedback about a code change that was applied.
+Possible outcomes:
+- success: the change worked, problem solved
+- failure: the change did not work, error remains
+- neutral: unclear or not feedback.
 
-Mensaje: "{user_message}"
+User message: "{user_message}"
 
-Si es feedback, genera JSON: {{"action": "feedback", "outcome": "success/failure", "comment": "..."}}
-Si no, {{"action": "none"}}
+If feedback, output JSON: {{"action": "feedback", "outcome": "success/failure", "comment": "..."}}
+If not feedback: {{"action": "none"}}
 
-Solo JSON.
+Output only JSON.
 """
         response = await self._call_llm(
             prompt=prompt,
-            system_prompt="Solo JSON.",
+            system_prompt="You output JSON only.",
             model_override=model,
             max_tokens=150,
             temperature=0.1,
@@ -2920,7 +3094,7 @@ Solo JSON.
                 response = response[:-3]
             data = json.loads(response)
             if data.get("action") == "feedback":
-                self._log_debug(f"Feedback interpretado: {data}")
+                self._log_debug(f"Parsed feedback intent: {data}")
                 return data
         except:
             pass
@@ -2929,7 +3103,7 @@ Solo JSON.
     async def _record_feedback(self, project_id: str, outcome: str, comment: str):
         state = self._get_state(project_id)
         if not state or not state["committed_changes"]:
-            self._log_debug("No hay cambios aplicados con los que asociar el feedback.")
+            self._log_debug("No committed changes to associate feedback with.")
             return
         last_commit = max(state["committed_changes"], key=lambda c: c.timestamp)
         success = outcome == "success"
@@ -2952,28 +3126,26 @@ Solo JSON.
             )
             last_commit.importance_score = max(0.5, last_commit.importance_score)
             self._log_debug(
-                f"Importancia reducida para cambio fallido {last_commit.hash} a {last_commit.importance_score:.1f}"
+                f"Reduced importance of failed change {last_commit.hash} to {last_commit.importance_score:.1f}"
             )
         else:
             last_commit.importance_score = min(10.0, last_commit.importance_score + 1.0)
         self._set_state(project_id, state)
-        self._log_debug(
-            f"Feedback registrado para cambio {last_commit.hash}: {outcome}"
-        )
+        self._log_debug(f"Recorded feedback for change {last_commit.hash}: {outcome}")
 
     def _get_feedback_context(self, project_id: str) -> str:
         state = self._get_state(project_id)
         if not state or not state["feedback_history"]:
             return ""
-        lines = ["## Retroalimentación sobre cambios recientes\n"]
+        lines = ["## Recent Change Feedback\n"]
         for fb in state["feedback_history"][-5:]:
-            status = "✅ ÉXITO" if fb.success else "❌ FALLO"
+            status = "✅ SUCCESS" if fb.success else "❌ FAILED"
             desc = fb.change_description.replace("\n", " ")[:100]
-            lines.append(f'- {status}: `{desc}` - Usuario: "{fb.user_comment}"')
+            lines.append(f'- {status}: `{desc}` - User: "{fb.user_comment}"')
         return "\n".join(lines)
 
     # --------------------------------------------------------------------------
-    # Token estimation para mensajes
+    # Token estimation for messages
     # --------------------------------------------------------------------------
     def _estimate_tokens(self, messages: List[dict]) -> int:
         if self.tokenizer:
@@ -2988,7 +3160,7 @@ Solo JSON.
         return total_chars // 4
 
     # --------------------------------------------------------------------------
-    # Contexto de código activo (excluyendo obsoletos)
+    # Active code context (excluding obsolete blocks)
     # --------------------------------------------------------------------------
     def _get_active_code_context(self, project_id: str) -> str:
         state = self._get_state(project_id)
@@ -3021,14 +3193,14 @@ Solo JSON.
             else []
         )
 
-        parts = ["## Contexto de código activo (por importancia)\n"]
+        parts = ["## Currently Active Code Context (by importance)\n"]
         if base_codes:
-            parts.append("### Código base (trabajo actual):")
+            parts.append("### Base Code (current work):")
             for b in base_codes:
                 loc = (
-                    f" (archivo: {b.file_path}"
+                    f" (file: {b.file_path}"
                     + (
-                        f", líneas {b.line_range[0]}-{b.line_range[1]}"
+                        f", lines {b.line_range[0]}-{b.line_range[1]}"
                         if b.line_range
                         else ""
                     )
@@ -3036,31 +3208,29 @@ Solo JSON.
                     if b.file_path
                     else ""
                 )
-                pin = " [ANCLADO]" if b.pinned else ""
+                pin = " [PINNED]" if b.pinned else ""
                 aff = (
-                    " [AFECTADO POR CAMBIO EN DEPENDENCIA]"
-                    if b.potentially_affected
-                    else ""
+                    " [AFFECTED BY DEPENDENCY CHANGE]" if b.potentially_affected else ""
                 )
                 parts.append(
-                    f"```\n{b.content[:600]}\n```{loc}  (importancia: {b.importance_score:.1f}){aff}{pin}"
+                    f"```\n{b.content[:600]}\n```{loc}  (importance: {b.importance_score:.1f}){aff}{pin}"
                 )
         if proposed:
-            parts.append("### Cambios propuestos (pendientes de revisión):")
+            parts.append("### Proposed Changes (pending review):")
             for b in proposed:
                 parts.append(f"```diff\n{b.content[:500]}\n```")
         if committed:
-            parts.append("### Cambios aplicados recientemente:")
+            parts.append("### Recently Committed Changes:")
             for b in committed:
                 parts.append(f"```\n{b.content[:300]}\n```")
         if errors:
-            parts.append("### Errores recientes:")
+            parts.append("### Recent Errors:")
             for b in errors:
                 parts.append(f"```\n{b.content[:500]}\n```")
         return "\n".join(parts)
 
     # --------------------------------------------------------------------------
-    # Actualización del código activo
+    # Update active code from message
     # --------------------------------------------------------------------------
     def _update_active_code(self, message: dict, project_id: str):
         if not self.valves.enable_code_awareness:
@@ -3085,7 +3255,7 @@ Solo JSON.
                 block.last_mentioned = time.time()
                 block._update_importance()
 
-        # Extracción asíncrona de bloques
+        # Extract code blocks (async but run in sync context)
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         extracted = loop.run_until_complete(self._extract_code_blocks(content))
@@ -3121,7 +3291,7 @@ Solo JSON.
                 new_block.importance_score = 10.0
                 new_block.pinned = True
                 self._log_debug(
-                    f"Marcador manual de importancia detectado para bloque {new_block.hash}, anclado automáticamente"
+                    f"Manual importance marker detected for block {new_block.hash}, pinned automatically"
                 )
 
             is_dup, existing = self._is_duplicate_code(
@@ -3138,7 +3308,7 @@ Solo JSON.
                     existing.mention_count += 1
                     existing.last_mentioned = time.time()
                     existing._update_importance()
-                    self._log_debug(f"Actualizado bloque existente {existing.hash}")
+                    self._log_debug(f"Updated existing block {existing.hash}")
                     if (
                         self.valves.enable_dependency_tracking
                         and self.valves.dependency_refresh_on_update
@@ -3156,11 +3326,11 @@ Solo JSON.
             ):
                 new_block.importance_score = max(new_block.importance_score, 7.0)
                 self._log_debug(
-                    f"Cambio propuesto {new_block.hash} marcado como conflictivo"
+                    f"Proposed change {new_block.hash} marked as conflicting"
                 )
 
             state["active_blocks"][new_block.hash] = new_block
-            self._log_debug(f"Nuevo bloque {content_type.value}: {new_block.hash}")
+            self._log_debug(f"New {content_type.value} block: {new_block.hash}")
 
             if content_type == ContentType.PROPOSED_CHANGE:
                 state["recent_changes"].append(new_block)
@@ -3181,7 +3351,7 @@ Solo JSON.
                                 break
                 else:
                     self._log_debug(
-                        f"Auto-aplicación omitida para cambio propuesto conflictivo {new_block.hash}"
+                        f"Skipped auto-apply for conflicting proposed change {new_block.hash}"
                     )
             elif content_type == ContentType.COMMITTED_CHANGE:
                 state["committed_changes"].append(new_block)
@@ -3220,7 +3390,7 @@ Solo JSON.
                     self._refresh_dependencies_for_block(new_block.hash, project_id)
                 )
 
-        # Aprendizaje del asistente: actualizar mejor bloque base coincidente
+        # Assistant learning: update best matching base block
         if role == "assistant" and len(extracted) > 0:
             for block_info in extracted:
                 best_base = None
@@ -3253,7 +3423,7 @@ Solo JSON.
                         best_base.importance_score + 1.0, 10.0
                     )
                     self._log_debug(
-                        f"Asistente actualizó bloque base {best_base.hash} (sim={best_sim:.2f})"
+                        f"Assistant updated base code block {best_base.hash} (sim={best_sim:.2f})"
                     )
                     if (
                         self.valves.enable_dependency_tracking
@@ -3325,7 +3495,7 @@ Solo JSON.
             for h in to_remove:
                 if h in state["active_blocks"]:
                     self._log_debug(
-                        f"Eliminado bloque duplicado {h} (importancia: {state['active_blocks'][h].importance_score:.1f})"
+                        f"Auto-removed duplicate block {h} (importance: {state['active_blocks'][h].importance_score:.1f})"
                     )
                     del state["active_blocks"][h]
             state["recent_changes"] = [
@@ -3336,19 +3506,19 @@ Solo JSON.
             ]
 
     # --------------------------------------------------------------------------
-    # Inlet (punto de entrada principal)
+    # Inlet (main entry point)
     # --------------------------------------------------------------------------
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
-        self._log_debug("inlet llamado")
+        self._log_debug("inlet called")
         messages = body.get("messages", [])
         project_id = self._get_project_id()
-        self._log_debug(f"ID del proyecto: {project_id}")
+        self._log_debug(f"Project ID: {project_id}")
         if not messages:
             return body
 
         state = self._get_state(project_id)
 
-        # 1. Comandos de olvido
+        # 1. Forget commands
         if (
             self.valves.enable_forget_command
             or self.valves.enable_natural_language_forget
@@ -3360,7 +3530,7 @@ Solo JSON.
                 body["messages"] = new_messages
                 return body
 
-        # 2. Comandos de recordar (anclar)
+        # 2. Remember commands (pin)
         if self.valves.enable_natural_language_forget:
             last_user_msg = (
                 messages[-1]
@@ -3385,7 +3555,7 @@ Solo JSON.
                     body["messages"] = new_messages
                     return body
 
-        # 3. Comandos de obsoleto
+        # 3. Obsolete marking
         if self.valves.enable_obsolete_marking:
             last_user_msg = (
                 messages[-1]
@@ -3395,7 +3565,7 @@ Solo JSON.
             if last_user_msg and (
                 last_user_msg.get("content", "").startswith("/obsolete")
                 or re.search(
-                    r"\b(marca|obsoleto|ya no sirve|revive)\b",
+                    r"\b(mark|obsolete|no longer|revive)\b",
                     last_user_msg.get("content", ""),
                     re.IGNORECASE,
                 )
@@ -3410,7 +3580,7 @@ Solo JSON.
                     body["messages"] = messages
                     return body
 
-        # 4. Razonamiento paso a paso (/think)
+        # 4. Chain-of-Thought (/think)
         if self.valves.enable_cot_on_demand:
             last_user_msg = (
                 messages[-1]
@@ -3424,19 +3594,19 @@ Solo JSON.
                 if cot_question:
                     active_ctx = self._get_active_code_context(project_id)
                     facts_ctx = self._get_facts_context(project_id)
-                    context = f"Código activo:\n{active_ctx}\n\nHechos:\n{facts_ctx}"
+                    context = f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
                     reasoning = await self._generate_cot(cot_question, context)
                     messages.pop()
                     messages.append(
                         {
                             "role": "assistant",
-                            "content": f"**Razonamiento paso a paso**\n{reasoning}",
+                            "content": f"**Chain-of-Thought Reasoning**\n{reasoning}",
                         }
                     )
                     body["messages"] = messages
                     return body
 
-        # 5. Extracción de supuestos (/assume)
+        # 5. Assumption extraction (/assume)
         if self.valves.enable_assumption_extraction:
             last_user_msg = (
                 messages[-1]
@@ -3453,13 +3623,13 @@ Solo JSON.
                     messages.append(
                         {
                             "role": "assistant",
-                            "content": f"**Análisis de supuestos**\n{analysis}",
+                            "content": f"**Assumption Analysis**\n{analysis}",
                         }
                     )
                     body["messages"] = messages
                     return body
 
-        # 6. Iteración (/iterate) - natural language y /iterate
+        # 6. Iterative execution (/iterate)
         if self.valves.enable_iterative_mode:
             last_user_msg = (
                 messages[-1]
@@ -3476,7 +3646,7 @@ Solo JSON.
                     body["messages"] = messages
                     return body
 
-        # 7. Selección inteligente de contexto (si está activada)
+        # 7. Smart context selection
         if self.valves.smart_context_selection and len(messages) > 0:
             last_user_idx = -1
             for i in range(len(messages) - 1, -1, -1):
@@ -3505,10 +3675,10 @@ Solo JSON.
                     messages = system_msgs + new_history
                     body["messages"] = messages
                     self._log_debug(
-                        f"Selección inteligente reemplazó historial con {len(new_history)} mensajes"
+                        f"Smart context selection replaced history with {len(new_history)} messages"
                     )
 
-        # 8. Detección de contradicciones
+        # 8. Contradiction detection
         if (
             self.valves.enable_contradiction_detection
             and self.valves.contradiction_inject_warning
@@ -3517,14 +3687,14 @@ Solo JSON.
             if contradiction_warning:
                 messages.insert(0, {"role": "system", "content": contradiction_warning})
                 body["messages"] = messages
-                self._log_debug("Advertencia de contradicción inyectada")
+                self._log_debug("Contradiction warning injected")
 
-        # 9. Actualizar código activo desde mensajes recientes
+        # 9. Update active code from recent messages
         if self.valves.enable_code_awareness:
             for msg in messages[-5:]:
                 self._update_active_code(msg, project_id)
 
-        # 10. Inyectar contexto LTM (si no se usó smart context)
+        # 10. LTM retrieval (if smart context not used)
         if not self.valves.smart_context_selection:
             last_user_msg = next(
                 (m for m in reversed(messages) if m.get("role") == "user"), None
@@ -3551,9 +3721,7 @@ Solo JSON.
                 )
                 all_mem = list(dict.fromkeys(base_mem + error_mem + general_mem))[:5]
                 if all_mem:
-                    ctx = "## Contexto relevante del pasado\n\n" + "\n---\n".join(
-                        all_mem
-                    )
+                    ctx = "## Relevant Past Context\n\n" + "\n---\n".join(all_mem)
                     sys_msgs = [m for m in messages if m.get("role") == "system"]
                     if sys_msgs:
                         sys_msgs[0]["content"] = ctx + "\n\n" + sys_msgs[0]["content"]
@@ -3561,7 +3729,25 @@ Solo JSON.
                         messages.insert(0, {"role": "system", "content": ctx})
                     body["messages"] = messages
 
-        # 11. Inyectar contexto de código activo
+        # 11. Response cache (check before LLM call)
+        if self.valves.enable_response_cache and HAS_SENTENCE:
+            last_user_msg = next(
+                (m for m in reversed(messages) if m.get("role") == "user"), None
+            )
+            if last_user_msg:
+                context_hash = self._compute_context_hash(messages)
+                cached = await self._find_cached_response(
+                    last_user_msg.get("content", ""), context_hash, state
+                )
+                if cached:
+                    messages.append(
+                        {"role": "assistant", "content": cached["response"]}
+                    )
+                    body["messages"] = messages
+                    self._log_debug("Returned cached response.")
+                    return body
+
+        # 12. Inject active code context
         active_ctx = self._get_active_code_context(project_id)
         if active_ctx:
             sys_msgs = [m for m in messages if m.get("role") == "system"]
@@ -3571,7 +3757,7 @@ Solo JSON.
                 messages.insert(0, {"role": "system", "content": active_ctx})
             body["messages"] = messages
 
-        # 12. Inyectar hechos
+        # 13. Inject facts
         if self.valves.enable_facts and self.valves.inject_facts_in_context:
             facts_ctx = self._get_facts_context(project_id)
             if facts_ctx:
@@ -3582,7 +3768,7 @@ Solo JSON.
                     messages.insert(0, {"role": "system", "content": facts_ctx})
                 body["messages"] = messages
 
-        # 13. Inyectar instrucción de confianza
+        # 14. Inject confidence scoring instruction
         if self.valves.enable_confidence_scoring:
             sys_msgs = [m for m in messages if m.get("role") == "system"]
             if sys_msgs:
@@ -3591,9 +3777,9 @@ Solo JSON.
                 messages.insert(
                     0, {"role": "system", "content": self.valves.confidence_prompt}
                 )
-                body["messages"] = messages
+            body["messages"] = messages
 
-        # 14. Inyectar retroalimentación
+        # 15. Inject feedback context
         if self.valves.enable_feedback_tracking and self.valves.inject_feedback_context:
             feedback_ctx = self._get_feedback_context(project_id)
             if feedback_ctx:
@@ -3606,7 +3792,7 @@ Solo JSON.
                     messages.insert(0, {"role": "system", "content": feedback_ctx})
                 body["messages"] = messages
 
-        # 15. Advertencia proactiva de contexto y sugerencias de comandos
+        # 16. Proactive suggestions (context usage & commands)
         system_msgs = [m for m in messages if m.get("role") == "system"]
         history_msgs = [m for m in messages if m.get("role") != "system"]
         total_tokens = self._estimate_tokens(system_msgs + history_msgs)
@@ -3624,7 +3810,7 @@ Solo JSON.
             messages.insert(0, {"role": "system", "content": cmd_suggestion})
             body["messages"] = messages
 
-        # 16. Detección de preguntas repetidas
+        # 17. Duplicate question detection
         if self.valves.duplicate_question_threshold and HAS_SENTENCE:
             last_user_msg = next(
                 (m for m in reversed(messages) if m.get("role") == "user"), None
@@ -3634,11 +3820,11 @@ Solo JSON.
                     last_user_msg.get("content", ""), project_id
                 )
                 if duplicate:
-                    warn_msg = f"⚠️ **Nota**: Esta pregunta es muy similar a una que hiciste antes (similitud {duplicate['sim']:.2f}). La respuesta anterior podría seguir siendo relevante. Si no es así, por favor aclara qué ha cambiado."
+                    warn_msg = f"⚠️ **Note**: This question is very similar to one you asked before (similarity {duplicate['sim']:.2f}). The previous answer might still be relevant. If not, please clarify what has changed."
                     messages.insert(0, {"role": "system", "content": warn_msg})
                     body["messages"] = messages
 
-        # 17. Recorte adaptativo (adaptative trim) si es necesario
+        # 18. Adaptive trim (fallback)
         system_msgs = [m for m in messages if m.get("role") == "system"]
         history_msgs = [m for m in messages if m.get("role") != "system"]
         trim_needed = False
@@ -3669,7 +3855,7 @@ Solo JSON.
                     history_msgs = [
                         {
                             "role": "assistant",
-                            "content": f"[Resumen de conversación anterior]\n{summary}",
+                            "content": f"[Summary of earlier conversation]\n{summary}",
                         }
                     ] + kept_block
                 else:
@@ -3702,14 +3888,33 @@ Solo JSON.
     # Outlet
     # --------------------------------------------------------------------------
     async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
-        self._log_debug("outlet llamado")
+        self._log_debug("outlet called")
         if not (HAS_SENTENCE and HAS_CHROMA and self.valves.enable_code_awareness):
             return body
         messages = body.get("messages", [])
         project_id = self._get_project_id()
+        state = self._get_state(project_id)
         for msg in messages:
             if msg.get("role") in ("user", "assistant"):
                 self._update_active_code(msg, project_id)
                 self._store_message_in_memory(msg, project_id)
+        # Store response in cache after generation (for the last user query)
+        if self.valves.enable_response_cache and HAS_SENTENCE and len(messages) >= 2:
+            last_user = next(
+                (m for m in reversed(messages) if m.get("role") == "user"), None
+            )
+            last_assistant = next(
+                (m for m in reversed(messages) if m.get("role") == "assistant"), None
+            )
+            if last_user and last_assistant:
+                context_hash = self._compute_context_hash(
+                    messages[:-1]
+                )  # exclude last assistant from context
+                await self._store_response_in_cache(
+                    last_user.get("content", ""),
+                    last_assistant.get("content", ""),
+                    context_hash,
+                    state,
+                )
         self._purge_expired_memories()
         return body
