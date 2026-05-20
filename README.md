@@ -333,18 +333,20 @@ The system also understands plain English commands such as:
 ---
 
 # Example Commands (Slash & Natural Language)
-
 | Action | Slash command | Natural language examples |
 |---|---|---|
-| **Forget context** | ```text<br>/forget all<br>/forget last<br>/forget file utils.py<br>/forget block abc123<br>``` | "forget my last message"<br>"forget the last two messages"<br>"forget everything about utils.py"<br>"forget the code block abc123"<br>"clear all context" |
-| **Pin / remember context** | ```text<br>/remember<br>/remember pin_last<br>/remember pin_file main.py<br>/remember pin_block calculate_total<br>``` | "remember this block"<br>"pin the last two changes"<br>"remember the file main.py"<br>"never forget the function calculate_total"<br>"pin all context" |
-| **Unpin** | ```text<br>/remember unpin_last<br>/remember unpin_file utils.py<br>/remember unpin_all<br>``` | "unpin the last block"<br>"remove the pin from utils.py"<br>"unpin everything" |
-| **Mark obsolete** | ```text<br>/obsolete<br>/obsolete last<br>/obsolete file legacy.py<br>/obsolete block old_function<br>``` | "mark this block as obsolete"<br>"the last two changes are obsolete"<br>"legacy.py is no longer needed"<br>"obsolete the function old_function"<br>"revive the last block" |
-| **Iterative task** | ```text<br>/iterate fix all bugs<br>/iterate --auto add tests<br>/iterate resume<br>``` | "implement all missing features step by step"<br>"fix the login bug iteratively"<br>"add unit tests automatically"<br>"continue where you left off" |
-| **Chain-of-thought** | ```text<br>/think Why does this code crash?<br>``` | "think step by step"<br>"reason about this algorithm"<br>"explain your reasoning" |
-| **Assumption extraction** | ```text<br>/assume "The network is reliable"<br>``` | "what assumptions does this code make?"<br>"extract hidden assumptions from this statement" |
-| **Fact management** | ```text<br>/fact add "The API key is stored in .env"<br>/fact list<br>/fact remove 2<br>``` | "remember this fact: the server uses port 8080"<br>"list all facts"<br>"forget fact number 2" |
-| **Recall cached response** | ```text<br>/recall "How to fix the database error?"<br>``` | "recall the solution for the memory leak"<br>"what did we do about the null pointer exception?" |
+| **Forget context** | `/forget all`<br>`/forget last`<br>`/forget file utils.py`<br>`/forget block abc123` | "forget my last message"<br>"forget the last two messages"<br>"forget everything about utils.py"<br>"forget the code block abc123"<br>"clear all context" |
+| **Pin / remember context** | `/remember`<br>`/remember pin_last`<br>`/remember pin_file main.py`<br>`/remember pin_block calculate_total` | "remember this block"<br>"pin the last two changes"<br>"remember the file main.py"<br>"never forget the function calculate_total"<br>"pin all context" |
+| **Unpin** | `/remember unpin_last`<br>`/remember unpin_file utils.py`<br>`/remember unpin_all` | "unpin the last block"<br>"remove the pin from utils.py"<br>"unpin everything" |
+| **Mark obsolete** | `/obsolete`<br>`/obsolete last`<br>`/obsolete file legacy.py`<br>`/obsolete block old_function` | "mark this block as obsolete"<br>"the last two changes are obsolete"<br>"legacy.py is no longer needed"<br>"obsolete the function old_function"<br>"revive the last block" |
+| **Iterative task** | `/iterate fix all bugs`<br>`/iterate --auto add tests`<br>`/iterate resume` | "implement all missing features step by step"<br>"fix the login bug iteratively"<br>"add unit tests automatically"<br>"continue where you left off" |
+| **Chain-of-thought** | `/think Why does this code crash?` | "think step by step"<br>"reason about this algorithm"<br>"explain your reasoning" |
+| **Assumption extraction** | `/assume "The network is reliable"` | "what assumptions does this code make?"<br>"extract hidden assumptions from this statement" |
+| **Fact management** | `/fact add "The API key is stored in .env"`<br>`/fact list`<br>`/fact remove 2` | "remember this fact: the server uses port 8080"<br>"list all facts"<br>"forget fact number 2" |
+| **Recall cached response** | `/recall "How to fix the database error?"` | "recall the solution for the memory leak"<br>"what did we do about the null pointer exception?" |
+---
+> **Note:**  
+> All natural language commands are interpreted by the LLM, so you don't need to memorise exact syntax—just express your intent in plain English (or Spanish, etc., depending on your prompt language).
 
 ---
 
