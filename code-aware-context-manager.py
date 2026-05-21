@@ -529,6 +529,17 @@ class Filter:
         self._purge_expired_memories()
         self._log_debug("LTM ready")
 
+    def _ensure_last_message_is_user(self, messages: List[dict]) -> List[dict]:
+        """Trim trailing assistant messages so the list ends with a user."""
+        if not messages:
+            return messages
+        while messages and messages[-1].get("role") != "user":
+            messages.pop()
+        if not messages:
+            messages.append({"role": "user", "content": "continue"})
+            self._log_debug("Inserted dummy user message to satisfy API")
+        return messages
+
     def _purge_expired_memories(self):
         if not HAS_CHROMA or self.memory_collection is None:
             return
@@ -3404,6 +3415,7 @@ Output only JSON.
                 messages, project_id, __user__
             )
             if handled:
+                new_messages = self._ensure_last_message_is_user(new_messages)
                 body["messages"] = new_messages
                 return body
 
@@ -3428,9 +3440,10 @@ Output only JSON.
                     confirmation = await self._execute_remember_intent(
                         project_id, remember_intent
                     )
-                    body["messages"] = messages + [
-                        {"role": "assistant", "content": confirmation}
-                    ]
+                    new_messages = self._ensure_last_message_is_user(
+                        messages + [{"role": "assistant", "content": confirmation}]
+                    )
+                    body["messages"] = new_messages
                     return body
 
         # 3. Obsolete
@@ -3450,7 +3463,7 @@ Output only JSON.
                     )
                     messages.pop()
                     messages.append({"role": "assistant", "content": confirmation})
-                    body["messages"] = messages
+                    body["messages"] = self._ensure_last_message_is_user(messages)
                     return body
 
         # 4. /think
@@ -3478,7 +3491,7 @@ Output only JSON.
                             "content": f"**Chain-of-Thought Reasoning**\n{reasoning}",
                         }
                     )
-                    body["messages"] = messages
+                    body["messages"] = self._ensure_last_message_is_user(messages)
                     return body
 
         # 5. /assume
@@ -3503,7 +3516,7 @@ Output only JSON.
                             "content": f"**Assumption Analysis**\n{analysis}",
                         }
                     )
-                    body["messages"] = messages
+                    body["messages"] = self._ensure_last_message_is_user(messages)
                     return body
 
         # 6. /iterate
@@ -3522,7 +3535,7 @@ Output only JSON.
                 if consumed:
                     messages.pop()
                     messages.append({"role": "assistant", "content": result})
-                    body["messages"] = messages
+                    body["messages"] = self._ensure_last_message_is_user(messages)
                     return body
 
         # 7. Smart context selection
@@ -3542,17 +3555,21 @@ Output only JSON.
                     historical = await self._retrieve_historical_messages(
                         query, project_id, self.valves.smart_context_top_k
                     )
+                    # Build list ending with the last user message
                     new_history = []
-                    if self.valves.smart_context_include_last_user:
-                        new_history.append(messages[last_user_idx])
-                        if (
-                            last_user_idx + 1 < len(messages)
-                            and messages[last_user_idx + 1].get("role") == "assistant"
-                        ):
-                            new_history.append(messages[last_user_idx + 1])
+                    # First, older historical messages (mixed roles)
                     for msg in historical:
                         if msg["content"] != query:
                             new_history.append(msg)
+                    # Then the last user message (guaranteed to be last)
+                    new_history.append(messages[last_user_idx])
+                    # Optionally include the assistant reply that follows it
+                    if (
+                        self.valves.smart_context_include_last_user
+                        and last_user_idx + 1 < len(messages)
+                        and messages[last_user_idx + 1].get("role") == "assistant"
+                    ):
+                        new_history.append(messages[last_user_idx + 1])
                     system_msgs = [m for m in messages if m.get("role") == "system"]
                     messages = system_msgs + new_history
                     body["messages"] = messages
@@ -3713,7 +3730,7 @@ Output only JSON.
                     messages.insert(0, {"role": "system", "content": warn_msg})
                     body["messages"] = messages
 
-        # 18. Adaptive trim
+        # 18. Adaptive context trim
         trim_needed = False
         if self.valves.adaptive_trim:
             total_tokens = self._estimate_tokens(system_msgs + history_msgs)
@@ -3730,9 +3747,23 @@ Output only JSON.
                 trim_needed = True
 
         if trim_needed and len(history_msgs) > self.valves.max_turns:
+            self._log_debug("18. Trimming old messages")
             keep = self.valves.max_turns
-            old_block = history_msgs[:-keep] if keep > 0 else []
-            kept_block = history_msgs[-keep:] if keep > 0 else []
+            # Asegurar que el último mensaje sea de usuario
+            last_user_idx = -1
+            for i in range(len(history_msgs) - 1, -1, -1):
+                if history_msgs[i].get("role") == "user":
+                    last_user_idx = i
+                    break
+            if last_user_idx != -1:
+                # Mantener desde el último mensaje de usuario hacia atrás
+                start_idx = max(0, last_user_idx - keep + 1)
+                old_block = history_msgs[:start_idx] if start_idx > 0 else []
+                kept_block = history_msgs[start_idx:]
+            else:
+                old_block = history_msgs[:-keep] if keep > 0 else []
+                kept_block = history_msgs[-keep:] if keep > 0 else []
+
             if self.valves.summarize_old_messages and old_block:
                 has_code = any("```" in m.get("content", "") for m in old_block)
                 summary = await self._summarize_messages(
@@ -3749,6 +3780,7 @@ Output only JSON.
                     history_msgs = kept_block
             else:
                 history_msgs = kept_block
+
             if self.valves.preserve_tool_calls:
                 while history_msgs and history_msgs[0].get("role") == "tool":
                     history_msgs.pop(0)
@@ -3768,7 +3800,24 @@ Output only JSON.
                     if not tool_call_ids.issubset(tool_response_ids):
                         history_msgs.pop(0)
 
-        body["messages"] = system_msgs + history_msgs
+        # Assemble final messages
+        messages = system_msgs + history_msgs
+
+        # 19. Final safety: ensure the last message is from user
+        if messages and messages[-1].get("role") != "user":
+            last_user_idx = -1
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get("role") == "user":
+                    last_user_idx = i
+                    break
+            if last_user_idx != -1:
+                messages = messages[: last_user_idx + 1]
+                self._log_debug("Trimmed trailing assistant messages")
+            else:
+                messages.append({"role": "user", "content": "continue"})
+                self._log_debug("Inserted dummy user message to satisfy API")
+
+        body["messages"] = messages
         return body
 
     # --------------------------------------------------------------------------
