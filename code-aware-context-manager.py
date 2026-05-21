@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants. Persists state
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.23.3
+version: 5.23.4
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz
 """
@@ -2070,48 +2070,59 @@ Output only JSON.
             or len(conversation_messages) < 4
         ):
             return None
+
         recent = conversation_messages[-10:]
-        has_potential = False
+
+        # Collect potentially contradictory user message pairs
+        contradictory_pairs = []
         for i, msg1 in enumerate(recent):
             for msg2 in recent[i + 1 :]:
-                if msg1.get("role") == msg2.get("role") == "user":
-                    sim = self._calculate_code_similarity(
-                        msg1.get("content", ""), msg2.get("content", "")
-                    )
-                    if sim > 0.6 and (
-                        "no " in msg2.get("content", "").lower()
-                        or "error" in msg2.get("content", "").lower()
-                    ):
-                        has_potential = True
-                        break
-            if has_potential:
-                break
-        if not has_potential:
+                if msg1.get("role") != "user" or msg2.get("role") != "user":
+                    continue
+                sim = self._calculate_code_similarity(
+                    msg1.get("content", ""), msg2.get("content", "")
+                )
+                if sim > 0.6:
+                    c1 = msg1.get("content", "").lower()
+                    c2 = msg2.get("content", "").lower()
+                    # Check if either message contains a negation marker
+                    if " no " in c1 or "error" in c1 or " no " in c2 or "error" in c2:
+                        contradictory_pairs.append((msg1, msg2))
+
+        # Only keep up to 3 pairs to avoid a huge prompt
+        contradictory_pairs = contradictory_pairs[:3]
+
+        if not contradictory_pairs:
             return None
+
+        # Build a concise prompt with only the relevant pairs
+        pair_texts = []
+        for idx, (msg1, msg2) in enumerate(contradictory_pairs, 1):
+            pair_texts.append(f"Pair {idx}:")
+            pair_texts.append(f"Message A: {msg1.get('content','')[:500]}")
+            pair_texts.append(f"Message B: {msg2.get('content','')[:500]}")
+            pair_texts.append("---")
+
+        conv_text = "\n".join(pair_texts)
+
         model = (
             self.valves.contradiction_detection_model
             or self.valves.llm_model
             or self.valves.summarization_model
         )
-        conv_text = "\n".join(
-            [f"{m.get('role')}: {m.get('content','')[:500]}" for m in recent]
-        )
-        prompt = f"""Analyze the following conversation for contradictions. Look for statements that conflict with each other, such as:
-- User says A and later says not A
-- Assistant provides inconsistent information
-- Code requirements that contradict
 
-If you find a contradiction, output JSON: {{"contradiction": true, "explanation": "...", "suggestion": "..."}}
+        prompt = f"""Analyze the following pairs of user messages for contradictions. A contradiction occurs when the user says something in one message and later says the opposite, or makes statements that conflict with each other.
+
+If you find a contradiction, output JSON: {{"contradiction": true, "explanation": "Brief explanation of the conflict", "suggestion": "What the user might really need"}}
 If no contradiction, output {{"contradiction": false}}.
 
-Conversation:
 {conv_text}
 
 Output only JSON.
 """
         response = await self._call_llm(
             prompt=prompt,
-            system_prompt="You are a contradiction detection assistant. Output JSON only.",
+            system_prompt="You are a contradiction detection assistant. Output only JSON.",
             model_override=model,
             max_tokens=300,
             temperature=0.1,
