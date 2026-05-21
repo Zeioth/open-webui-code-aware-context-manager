@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants. Persists state
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.23.2
+version: 5.23.3
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz
 """
@@ -325,6 +325,9 @@ class Filter:
         affected_importance_penalty: float = Field(default=0.7)
         affected_decay_hours: float = Field(default=4.0)
 
+        llm_request_timeout: int = Field(
+            default=300, description="Timeout in seconds for LLM API calls."
+        )
         track_active_code_age: bool = Field(default=True)
         active_code_timeout_minutes: int = Field(default=30)
 
@@ -388,6 +391,12 @@ class Filter:
 
         if self.valves.enable_facts:
             self._log_debug("Fact storage enabled.")
+
+        # Reusable HTTP session for LLM calls
+        self._http_session: Optional[aiohttp.ClientSession] = None
+        if HAS_AIOHTTP:
+            timeout = aiohttp.ClientTimeout(total=self.valves.llm_request_timeout)
+            self._http_session = aiohttp.ClientSession(timeout=timeout)
 
         print("[CodeAware] Filter loaded (v5.23.2)")
 
@@ -455,7 +464,10 @@ class Filter:
             data["response_cache"] = []
         active = {}
         for k, v in data.get("active_blocks", {}).items():
-            active[k] = CodeBlock(**v)
+            try:
+                active[k] = CodeBlock(**v)
+            except Exception:
+                self._log_debug(f"Skipping corrupted block {k} in state DB")
         recent = [CodeBlock(**b) for b in data.get("recent_changes", [])]
         committed = [CodeBlock(**b) for b in data.get("committed_changes", [])]
         feedback = [
@@ -863,7 +875,7 @@ class Filter:
         max_tokens: int = 500,
         temperature: float = 0.3,
     ) -> Optional[str]:
-        if not HAS_AIOHTTP:
+        if not HAS_AIOHTTP or not self._http_session:
             return None
 
         base_url = self.valves.LLM_BASE_URL.rstrip("/")
@@ -899,59 +911,62 @@ class Filter:
                     return cached
 
             try:
-                async with aiohttp.ClientSession() as session:
-                    if is_ollama:
-                        url = f"{base_url}/api/generate"
-                        payload = {
-                            "model": model_name,
-                            "prompt": prompt,
-                            "system": system_prompt,
-                            "stream": False,
-                            "options": {
-                                "temperature": temperature,
-                                "num_predict": max_tokens,
-                            },
-                        }
-                        headers = {"Content-Type": "application/json"}
-                    else:
-                        url = f"{base_url}/v1/chat/completions"
-                        headers = {"Content-Type": "application/json"}
-                        if api_token:
-                            headers["Authorization"] = f"Bearer {api_token}"
-                        elif self.valves.openai_api_key:
-                            headers["Authorization"] = (
-                                f"Bearer {self.valves.openai_api_key}"
-                            )
-                        payload = {
-                            "model": model_name,
-                            "messages": [
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": prompt},
-                            ],
+                if is_ollama:
+                    url = f"{base_url}/api/generate"
+                    payload = {
+                        "model": model_name,
+                        "prompt": prompt,
+                        "system": system_prompt,
+                        "stream": False,
+                        "options": {
                             "temperature": temperature,
-                            "max_tokens": max_tokens,
-                        }
+                            "num_predict": max_tokens,
+                        },
+                    }
+                    headers = {"Content-Type": "application/json"}
+                else:
+                    url = f"{base_url}/v1/chat/completions"
+                    headers = {"Content-Type": "application/json"}
+                    if api_token:
+                        headers["Authorization"] = f"Bearer {api_token}"
+                    elif self.valves.openai_api_key:
+                        headers["Authorization"] = (
+                            f"Bearer {self.valves.openai_api_key}"
+                        )
+                    payload = {
+                        "model": model_name,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                    }
 
-                    async with session.post(
-                        url, json=payload, headers=headers, timeout=30
-                    ) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            if is_ollama:
-                                content = data.get("response", "")
-                                if not content.strip():
-                                    continue
-                                content = content.strip()
-                            else:
-                                content = data["choices"][0]["message"][
-                                    "content"
-                                ].strip()
-                            self._llm_cache[cache_key] = (time.time(), content)
-                            return content
+                async with self._http_session.post(
+                    url, json=payload, headers=headers
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if is_ollama:
+                            content = data.get("response", "")
+                            if not content.strip():
+                                continue
+                            content = content.strip()
                         else:
-                            self._log_debug(
-                                f"LLM call failed with model {model_name}, status {resp.status}"
-                            )
+                            choices = data.get("choices", [])
+                            if not choices:
+                                continue
+                            content = choices[0].get("message", {}).get("content", "")
+                            if not content:
+                                continue
+                            content = content.strip()
+                        self._llm_cache[cache_key] = (time.time(), content)
+                        return content
+                    else:
+                        self._log_debug(
+                            f"LLM call failed with model {model_name}, status {resp.status}"
+                        )
             except Exception as e:
                 self._log_debug(f"LLM model {model_name} error: {e}")
                 continue
