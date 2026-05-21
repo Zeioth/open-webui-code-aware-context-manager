@@ -226,10 +226,8 @@ class Filter:
             default=100,
             description="Number of messages after which to trigger compression.",
         )
-        # MODELO -> default cambiado
         hierarchical_summary_model: str = Field(
-            default="ollama/llama3.2:3B",
-            description="Model for hierarchical summaries.",
+            default="llama3.2:3b", description="Model for hierarchical summaries."
         )
         hierarchical_summary_max_tokens: int = Field(
             default=800, description="Max tokens for hierarchical summary."
@@ -264,22 +262,25 @@ class Filter:
             default=True, description="Enable /think command for chain-of-thought."
         )
         cot_model: str = Field(
-            default="ollama/llama3.2:3B",
-            description="Model for chain-of-thought reasoning.",
+            default="llama3.2:3b", description="Model for chain-of-thought reasoning."
+        )
+        cot_max_tokens: int = Field(
+            default=1000, description="Max tokens for chain-of-thought response."
         )
         enable_assumption_extraction: bool = Field(
             default=True, description="Enable /assume command."
         )
         assumption_extraction_model: str = Field(
-            default="ollama/llama3.2:3B",
-            description="Model for assumption extraction.",
+            default="llama3.2:3b", description="Model for assumption extraction."
         )
         enable_contradiction_detection: bool = Field(
             default=True, description="Detect contradictions in conversation."
         )
         contradiction_detection_model: str = Field(
-            default="ollama/llama3.2:3B",
-            description="Model for contradiction detection.",
+            default="llama3.2:3b", description="Model for contradiction detection."
+        )
+        contradiction_inject_warning: bool = Field(
+            default=True, description="Inject contradiction warning into system prompt."
         )
         proactive_context_warning_threshold: float = Field(
             default=0.85,
@@ -324,13 +325,12 @@ class Filter:
         iterative_diff_format: str = Field(
             default="unified", description="Diff format: 'unified' or 'context'."
         )
-        # MODELOS con nuevo default
         iterative_planning_model: str = Field(
-            default="ollama/llama3.2:3B",
+            default="llama3.2:3b",
             description="Model for planning (if empty, uses llm_model).",
         )
         iterative_execution_model: str = Field(
-            default="ollama/llama3.2:3B",
+            default="llama3.2:3b",
             description="Model for step execution (if empty, uses same as planning).",
         )
         iterative_resume_command: str = Field(
@@ -437,9 +437,8 @@ class Filter:
             default=True,
             description="Always extract function/class signatures even when summarizing code.",
         )
-        # MODELO con default
         summary_fallback_model: str = Field(
-            default="ollama/llama3.2:3B",
+            default="llama3.2:3b",
             description="Model for selective summarization (if empty, uses summarization_model).",
         )
         summary_include_metadata: bool = Field(
@@ -450,7 +449,7 @@ class Filter:
             default=True, description="Summarize discarded message blocks."
         )
         summarization_model: str = Field(
-            default="ollama/llama3.2:3B", description="Default summarization model."
+            default="llama3.2:3b", description="Default summarization model."
         )
         openai_api_base: str = Field(
             default=os.getenv("OPENAI_API_BASE", "http://localhost:8080/v1"),
@@ -500,6 +499,7 @@ class Filter:
             description="Regex for file paths.",
         )
 
+        # Oversized code block handling
         max_code_block_tokens: int = Field(
             default=20000, description="Maximum tokens for a code block (0 = no limit)."
         )
@@ -508,8 +508,7 @@ class Filter:
             description="Action for oversized blocks: 'truncate', 'summarize', or 'warn'.",
         )
         code_block_summary_model: str = Field(
-            default="ollama/llama3.2:3B",
-            description="Model for summarizing oversized blocks.",
+            default="llama3.2:3b", description="Model for summarizing oversized blocks."
         )
         code_block_truncate_keep_head: int = Field(
             default=50, description="Lines to keep from beginning when truncating."
@@ -607,13 +606,12 @@ class Filter:
             default=True, description="Summarize inactive code blocks."
         )
         inactive_code_summary_model: str = Field(
-            default="ollama/llama3.2:3B",
-            description="Model for inactive code summaries.",
+            default="llama3.2:3b", description="Model for inactive code summaries."
         )
 
         llm_model: str = Field(
-            default="ollama/llama3.2:3B",
-            description="Preferred model (e.g., 'ollama/llama3.2:3b'). Falls back to summarization_model.",
+            default="llama3.2:3b",
+            description="Preferred model (e.g., 'llama3.2:3b'). Falls back to summarization_model.",
         )
 
         enable_forget_command: bool = Field(
@@ -623,7 +621,7 @@ class Filter:
             default=True, description="Interpret natural language forget."
         )
         natural_language_forget_model: str = Field(
-            default="ollama/llama3.2:3B", description="Model for forget intent parsing."
+            default="llama3.2:3b", description="Model for forget intent parsing."
         )
 
     class UserValves(BaseModel):
@@ -673,6 +671,9 @@ class Filter:
 
         if self.valves.enable_facts:
             self._log_debug("Fact storage enabled.")
+
+        # Always visible startup message
+        print("[CodeAware] Filter loaded (v5.23)")
 
     # --------------------------------------------------------------------------
     # LRU cache
@@ -806,7 +807,7 @@ class Filter:
         if self.valves.long_term_memory_expiration_days <= 0:
             return
         try:
-            now = datetime.utcnow().isoformat()
+            now = time.time()
             expired = self.memory_collection.get(where={"expires_at": {"$lt": now}})
             if expired and expired["ids"]:
                 self.memory_collection.delete(ids=expired["ids"])
@@ -815,27 +816,7 @@ class Filter:
             logger.warning(f"Purge failed: {e}")
 
     # --------------------------------------------------------------------------
-    # Proactive context warning
-    # --------------------------------------------------------------------------
-    def _check_context_usage_and_warn(
-        self, system_msgs: List[dict], history_msgs: List[dict]
-    ) -> Optional[str]:
-        if self.valves.proactive_context_warning_threshold <= 0:
-            return None
-        total_tokens = self._estimate_tokens(system_msgs + history_msgs)
-        max_tokens = self.valves.context_window_tokens
-        if max_tokens <= 0:
-            return None
-        usage_ratio = total_tokens / max_tokens
-        if usage_ratio >= self.valves.proactive_context_warning_threshold:
-            percent = int(usage_ratio * 100)
-            return self.valves.proactive_context_warning_message.format(
-                percent=percent, used_tokens=total_tokens, max_tokens=max_tokens
-            )
-        return None
-
-    # --------------------------------------------------------------------------
-    # Fact management
+    # Fact management (unchanged)
     # --------------------------------------------------------------------------
     def _extract_facts_from_message(self, content: str) -> List[str]:
         pattern = r"\[FACT:\s*(.*?)\]"
@@ -898,7 +879,7 @@ class Filter:
         )
 
     # --------------------------------------------------------------------------
-    # Response cache (semantic caching)
+    # Response cache
     # --------------------------------------------------------------------------
     def _compute_context_hash(self, messages: List[dict]) -> str:
         if not self.valves.response_cache_include_context_hash:
@@ -977,19 +958,8 @@ class Filter:
         state["response_cache"] = new_cache
         self._log_debug(f"Stored response in cache for query: {query[:50]}...")
 
-    async def _recall_command(self, project_id: str, query_part: str) -> str:
-        state = self._get_state(project_id)
-        if not state:
-            return "No active project state."
-        context_hash = self._compute_context_hash([])
-        entry = await self._find_cached_response(query_part, context_hash, state)
-        if entry:
-            return f"**Cached response** (similarity: high)\n{entry['response']}"
-        else:
-            return f"No cached response found for query: {query_part}"
-
     # --------------------------------------------------------------------------
-    # AST-based dependency extraction (for Python)
+    # AST & LLM helpers
     # --------------------------------------------------------------------------
     def _extract_dependencies_ast(self, code: str) -> Tuple[List[str], List[str]]:
         imports = []
@@ -1076,9 +1046,6 @@ Example output: ["os", "Path", "utils.py", "calculate_total"]
                 pass
             return []
 
-    # --------------------------------------------------------------------------
-    # Oversized code block handling
-    # --------------------------------------------------------------------------
     def _estimate_code_tokens(self, code: str) -> int:
         if self.tokenizer:
             return len(self.tokenizer.encode(code))
@@ -1149,237 +1116,6 @@ Code:
             return code
 
     # --------------------------------------------------------------------------
-    # Dependency update helpers (using hybrid extraction)
-    # --------------------------------------------------------------------------
-    async def _update_dependencies(self, block_hash: str, state: Dict):
-        block = state["active_blocks"].get(block_hash)
-        if not block:
-            return
-        deps = await self._extract_dependencies_hybrid(block.content, block.file_path)
-        # Also store AST-specific fields for later reference
-        if (
-            block.file_path
-            and block.file_path.endswith(".py")
-            or "def " in block.content
-        ):
-            imports, calls = self._extract_dependencies_ast(block.content)
-            block.ast_imports = imports
-            block.ast_calls = calls
-        block.dependencies = deps
-        self._log_debug(f"Updated dependencies for block {block_hash}: {deps}")
-
-    async def _mark_affected_blocks(self, changed_hash: str, state: Dict):
-        changed_block = state["active_blocks"].get(changed_hash)
-        if not changed_block:
-            return
-        affected_identifiers = set()
-        if changed_block.file_path:
-            base = os.path.splitext(os.path.basename(changed_block.file_path))[0]
-            affected_identifiers.add(base)
-            affected_identifiers.add(changed_block.file_path)
-        sig = self._extract_signature(changed_block.content)
-        if sig:
-            name_match = re.search(r"`([A-Za-z_][A-Za-z0-9_]*)", sig)
-            if name_match:
-                affected_identifiers.add(name_match.group(1))
-        for h, block in state["active_blocks"].items():
-            if h == changed_hash:
-                continue
-            block_deps = (
-                block.dependencies
-                + getattr(block, "ast_imports", [])
-                + getattr(block, "ast_calls", [])
-            )
-            if any(dep in affected_identifiers for dep in block_deps):
-                block.potentially_affected = True
-                block.affected_timestamp = time.time()
-                block._update_importance()
-                self._log_debug(
-                    f"Block {h} marked as potentially affected due to dependency on {changed_hash}"
-                )
-
-    async def _refresh_dependencies_for_block(self, block_hash: str, project_id: str):
-        if not self.valves.enable_dependency_tracking:
-            return
-        state = self._get_state(project_id)
-        if not state or block_hash not in state["active_blocks"]:
-            return
-        await self._update_dependencies(block_hash, state)
-        await self._mark_affected_blocks(block_hash, state)
-        self._set_state(project_id, state)
-
-    async def _clean_affected_flags(self, project_id: str):
-        if not self.valves.enable_dependency_tracking:
-            return
-        state = self._get_state(project_id)
-        if not state:
-            return
-        now = time.time()
-        decay = self.valves.affected_decay_hours * 3600
-        if decay <= 0:
-            return
-        changed = False
-        for block in state["active_blocks"].values():
-            if block.potentially_affected and (now - block.affected_timestamp) > decay:
-                block.potentially_affected = False
-                block._update_importance()
-                changed = True
-                self._log_debug(f"Cleared affected flag for block {block.hash}")
-        if changed:
-            self._set_state(project_id, state)
-
-    # --------------------------------------------------------------------------
-    # Reranking
-    # --------------------------------------------------------------------------
-    def _load_reranker(self):
-        if not self.valves.enable_reranking or not HAS_CROSS_ENCODER:
-            return
-        if self._cross_encoder is None:
-            try:
-                self._cross_encoder = CrossEncoder(self.valves.reranker_model)
-                self._log_debug(f"Loaded reranker model {self.valves.reranker_model}")
-            except Exception as e:
-                logger.warning(f"Failed to load reranker model: {e}")
-                self.valves.enable_reranking = False
-
-    async def _rerank_results(
-        self, query: str, documents: List[str], top_k: int
-    ) -> List[str]:
-        if not self.valves.enable_reranking or not self._cross_encoder or not documents:
-            return documents[:top_k]
-        pairs = [(query, doc) for doc in documents]
-        scores = self._cross_encoder.predict(pairs)
-        scored = list(zip(documents, scores))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return [doc for doc, _ in scored[:top_k]]
-
-    # --------------------------------------------------------------------------
-    # Code extraction and classification
-    # --------------------------------------------------------------------------
-    async def _extract_code_blocks(self, content: str) -> List[Dict[str, Any]]:
-        blocks = []
-        if not self.valves.auto_detect_code_blocks:
-            return blocks
-        for match in self.code_pattern.finditer(content):
-            lang = match.group(1) or "text"
-            code = match.group(2).strip()
-            code = await self._handle_oversized_code_block(code, lang)
-            blocks.append({"language": lang, "code": code, "type": "fenced"})
-        lines = content.split("\n")
-        indented = []
-        for line in lines:
-            if line.startswith(("    ", "\t")):
-                indented.append(line.lstrip(" \t"))
-            else:
-                if len(indented) >= 3:
-                    code = "\n".join(indented)
-                    code = await self._handle_oversized_code_block(code, "text")
-                    blocks.append(
-                        {"language": "text", "code": code, "type": "indented"}
-                    )
-                indented = []
-        if len(indented) >= 3:
-            code = "\n".join(indented)
-            code = await self._handle_oversized_code_block(code, "text")
-            blocks.append({"language": "text", "code": code, "type": "indented"})
-        return blocks
-
-    def _extract_line_range(
-        self, content: str
-    ) -> Tuple[Optional[str], Optional[int], Optional[int]]:
-        if not self.valves.track_line_numbers:
-            return None, None, None
-        pattern = r"(?:^|\s)([a-zA-Z0-9_\-\./]+\.\w+):(\d+)(?:-(\d+))?"
-        match = re.search(pattern, content)
-        if match:
-            file_path = match.group(1)
-            line_start = int(match.group(2))
-            line_end = int(match.group(3)) if match.group(3) else line_start
-            return file_path, line_start, line_end
-        return None, None, None
-
-    def _extract_file_paths(self, content: str) -> List[str]:
-        if not self.valves.track_file_paths:
-            return []
-        return re.findall(self.valves.file_path_pattern, content)
-
-    def _classify_content(
-        self, content: str, extracted_blocks: List[Dict]
-    ) -> ContentType:
-        cl = content.lower()
-        if self.valves.enable_feedback_tracking:
-            if re.search(r"\b(worked|yes|correct|resolved|fixed)\b", cl) and re.search(
-                r"\b(change|solution|fix|diff)\b", cl
-            ):
-                return ContentType.GENERAL
-            if re.search(r"\b(did not work|failed|error|still broken|incorrect)\b", cl):
-                return ContentType.GENERAL
-            if content.startswith("/feedback"):
-                return ContentType.GENERAL
-        if self.diff_pattern.search(content) or "diff --git" in content:
-            return ContentType.PROPOSED_CHANGE
-        if self.commit_pattern.search(content):
-            if "applied" in cl or "committed" in cl or "merged" in cl:
-                return ContentType.COMMITTED_CHANGE
-            return ContentType.PROPOSED_CHANGE
-        if "error" in cl or "exception" in cl or "traceback" in cl:
-            return ContentType.ERROR
-        if '"tool_calls"' in content or '"function"' in content:
-            return ContentType.TOOL_CALL
-        for blk in extracted_blocks:
-            if blk["language"] in [
-                "python",
-                "javascript",
-                "typescript",
-                "go",
-                "rust",
-                "java",
-                "cpp",
-            ]:
-                if (
-                    "def " in blk["code"]
-                    or "class " in blk["code"]
-                    or "function " in blk["code"]
-                ):
-                    return ContentType.BASE_CODE
-        return ContentType.GENERAL
-
-    # --------------------------------------------------------------------------
-    # Helper: content-aware summarization prompt
-    # --------------------------------------------------------------------------
-    def _get_summary_prompt_for_content(
-        self, content_type: ContentType, text: str, max_tokens: int
-    ) -> str:
-        if not self.valves.selective_summarization:
-            return f"Summarise the following conversation. Keep key decisions, actions, and important context. Be concise.\n\n{text}"
-
-        if content_type == ContentType.ERROR:
-            if self.valves.error_preserve_verbatim:
-                return text
-            else:
-                return f"Summarise the following error message, keeping the error type, location, and root cause. Do not omit technical details.\n\n{text}"
-        elif content_type in (
-            ContentType.BASE_CODE,
-            ContentType.PROPOSED_CHANGE,
-            ContentType.COMMITTED_CHANGE,
-        ):
-            level = self.valves.code_summary_level
-            if level == "minimal":
-                instruction = "Extract only the function/class signatures and the overall purpose. Do not include implementation details."
-            elif level == "detailed":
-                instruction = "Summarise the code, keeping key functions, classes, important logic, and any comments. Aim for a medium level of detail."
-            else:
-                instruction = "Summarise the code, focusing on what it does, its main functions/classes, and any non-trivial logic."
-            return f"{instruction}\n\n```\n{text[:3000]}\n```"
-        elif content_type == ContentType.TOOL_CALL:
-            if self.valves.tool_call_preserve:
-                return text
-            else:
-                return f"Summarise the following tool call sequence, keeping the tool names and main parameters.\n\n{text}"
-        else:
-            return f"Summarise the following conversation, keeping key decisions, action items, and unresolved issues. Be concise (target {max_tokens} tokens).\n\n{text}"
-
-    # --------------------------------------------------------------------------
     # LLM helper
     # --------------------------------------------------------------------------
     async def _call_llm(
@@ -1435,7 +1171,7 @@ Code:
         return None
 
     # --------------------------------------------------------------------------
-    # Helpers for function names, signatures, similarity
+    # Helpers (signatures, similarity, etc.)
     # --------------------------------------------------------------------------
     def _extract_function_names(self, code: str) -> List[str]:
         names = []
@@ -1628,7 +1364,7 @@ Code:
         return False
 
     # --------------------------------------------------------------------------
-    # Expiration (skip pinned and obsolete blocks)
+    # Expiration
     # --------------------------------------------------------------------------
     async def _expire_blocks_by_time(self, project_id: str):
         state = self._get_state(project_id)
@@ -1740,12 +1476,13 @@ Keep the summary under 150 words.
             return
 
         try:
+            now = time.time()
             where_filter = {
-                "project_id": project_id,
                 "$and": [
+                    {"project_id": {"$eq": project_id}},
                     {"is_hierarchical_summary": {"$ne": True}},
-                    {"timestamp": {"$lt": datetime.utcnow().isoformat()}},
-                ],
+                    {"timestamp": {"$lt": now}},
+                ]
             }
             results = self.memory_collection.get(
                 where=where_filter,
@@ -1768,7 +1505,7 @@ Keep the summary under 150 words.
 
         pairs = sorted(
             zip(results["ids"], results["documents"], results["metadatas"]),
-            key=lambda x: x[2].get("timestamp", ""),
+            key=lambda x: x[2].get("timestamp", 0),
         )
         to_compress = pairs[: self.valves.hierarchical_compression_interval_messages]
 
@@ -1809,7 +1546,7 @@ Conversation segment:
                 {
                     "role": "assistant",
                     "project_id": project_id,
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": time.time(),
                     "is_hierarchical_summary": True,
                     "summary_level": 1,
                     "source_message_ids": ",".join(
@@ -1828,7 +1565,7 @@ Conversation segment:
         self._set_state(project_id, state)
 
     # --------------------------------------------------------------------------
-    # Duplicate removal (skip pinned and obsolete)
+    # Duplicate removal
     # --------------------------------------------------------------------------
     def _remove_duplicate_blocks(self, state: Dict):
         if not self.valves.auto_remove_duplicate_blocks:
@@ -1875,7 +1612,7 @@ Conversation segment:
             ]
 
     # --------------------------------------------------------------------------
-    # Consecutive similar message handling (deduplication)
+    # Consecutive message dedup
     # --------------------------------------------------------------------------
     async def _summarize_diff_between_messages(self, msg1: dict, msg2: dict) -> str:
         content1 = msg1.get("content", "")
@@ -2079,7 +1816,7 @@ Output only JSON.
             return "Unrecognized obsolete action."
 
     # --------------------------------------------------------------------------
-    # Proactive summarization suggestion
+    # Proactive suggestions
     # --------------------------------------------------------------------------
     async def _check_and_suggest_summarization(
         self, project_id: str, current_tokens: int, max_tokens: int
@@ -2114,15 +1851,22 @@ Output only JSON.
         return "⚠️ **Context nearly full**\n" + "\n".join(suggestion_parts)
 
     # --------------------------------------------------------------------------
-    # Duplicate question detection
+    # Duplicate question detection (ChromaDB with $and)
     # --------------------------------------------------------------------------
     async def _find_duplicate_question(
         self, query: str, project_id: str
     ) -> Optional[Dict]:
         if not self.valves.duplicate_question_threshold or not HAS_SENTENCE:
             return None
+        # Use $and for multiple equality filters
+        where_filter = {
+            "$and": [
+                {"project_id": {"$eq": project_id}},
+                {"role": {"$eq": "user"}},
+            ]
+        }
         results = self.memory_collection.get(
-            where={"project_id": project_id, "role": "user"},
+            where=where_filter,
             limit=self.valves.duplicate_question_lookback,
             include=["documents", "metadatas"],
         )
@@ -2144,7 +1888,7 @@ Output only JSON.
         return best_entry
 
     # --------------------------------------------------------------------------
-    # Context-aware command suggestions
+    # Command suggestions
     # --------------------------------------------------------------------------
     async def _suggest_commands(self, project_id: str, state: Dict) -> Optional[str]:
         if not self.valves.enable_command_suggestions:
@@ -2183,7 +1927,7 @@ Output only JSON.
         return None
 
     # --------------------------------------------------------------------------
-    # Message summarization (selective)
+    # Message summarization
     # --------------------------------------------------------------------------
     async def _summarize_messages(
         self, messages: List[dict], is_code_context: bool = False
@@ -2240,8 +1984,40 @@ Output only JSON.
             summary = f"[Summary of {len(messages)} messages, type: {dominant_type.value}]\n{summary}"
         return summary
 
+    def _get_summary_prompt_for_content(
+        self, content_type: ContentType, text: str, max_tokens: int
+    ) -> str:
+        if not self.valves.selective_summarization:
+            return f"Summarise the following conversation. Keep key decisions, actions, and important context. Be concise.\n\n{text}"
+
+        if content_type == ContentType.ERROR:
+            if self.valves.error_preserve_verbatim:
+                return text
+            else:
+                return f"Summarise the following error message, keeping the error type, location, and root cause. Do not omit technical details.\n\n{text}"
+        elif content_type in (
+            ContentType.BASE_CODE,
+            ContentType.PROPOSED_CHANGE,
+            ContentType.COMMITTED_CHANGE,
+        ):
+            level = self.valves.code_summary_level
+            if level == "minimal":
+                instruction = "Extract only the function/class signatures and the overall purpose. Do not include implementation details."
+            elif level == "detailed":
+                instruction = "Summarise the code, keeping key functions, classes, important logic, and any comments. Aim for a medium level of detail."
+            else:
+                instruction = "Summarise the code, focusing on what it does, its main functions/classes, and any non-trivial logic."
+            return f"{instruction}\n\n```\n{text[:3000]}\n```"
+        elif content_type == ContentType.TOOL_CALL:
+            if self.valves.tool_call_preserve:
+                return text
+            else:
+                return f"Summarise the following tool call sequence, keeping the tool names and main parameters.\n\n{text}"
+        else:
+            return f"Summarise the following conversation, keeping key decisions, action items, and unresolved issues. Be concise (target {max_tokens} tokens).\n\n{text}"
+
     # --------------------------------------------------------------------------
-    # Chain-of-Thought reasoning (/think)
+    # Chain-of-Thought
     # --------------------------------------------------------------------------
     async def _parse_cot_intent(self, user_message: str) -> Optional[str]:
         if not self.valves.enable_cot_on_demand:
@@ -2282,7 +2058,7 @@ Proceed step by step.
         return response or "Could not generate reasoning."
 
     # --------------------------------------------------------------------------
-    # Assumption extraction (/assume)
+    # Assumption extraction
     # --------------------------------------------------------------------------
     async def _parse_assumption_intent(self, user_message: str) -> Optional[str]:
         if not self.valves.enable_assumption_extraction:
@@ -2378,7 +2154,7 @@ Output only JSON.
         return None
 
     # --------------------------------------------------------------------------
-    # Forget commands (natural language)
+    # Forget / Remember
     # --------------------------------------------------------------------------
     async def _parse_forget_intent(self, user_message: str) -> Optional[Dict]:
         if not self.valves.enable_natural_language_forget:
@@ -2539,9 +2315,6 @@ Output only JSON.
 
         return messages, False
 
-    # --------------------------------------------------------------------------
-    # Remember (pin) commands
-    # --------------------------------------------------------------------------
     async def _parse_remember_intent(self, user_message: str) -> Optional[Dict]:
         if not self.valves.enable_natural_language_forget:
             return None
@@ -2655,7 +2428,7 @@ Output only JSON.
             return "Unrecognized pin action."
 
     # --------------------------------------------------------------------------
-    # Iterative task execution (/iterate)
+    # Iterative task execution
     # --------------------------------------------------------------------------
     async def _generate_plan(self, goal: str, context: str) -> List[Dict]:
         model = (
@@ -2744,7 +2517,6 @@ Generate a unified diff that applies this change. Use the format:
  If the file doesn't exist in the provided context, assume it is a new file and create a diff from empty (e.g., use /dev/null as original).
 Output only the diff, enclosed in diff ... .
 """
-
         response = await self._call_llm(
             prompt=prompt,
             system_prompt="You are a code assistant that generates correct unified diffs. Output only the diff with proper formatting.",
@@ -2854,7 +2626,6 @@ Output only the diff, enclosed in diff ... .
                 ):
                     return await self._execute_next_step(project_id), True
                 return "Failed to start iteration.", True
-        # Natural language continuation
         if current_iter and command.lower() in [
             "siguiente",
             "continue",
@@ -2865,7 +2636,6 @@ Output only the diff, enclosed in diff ... .
             "apply",
         ]:
             return await self._execute_next_step(project_id), True
-        # Natural language start
         if re.search(
             r"\b(implement|do|execute) (all|step by step|iteratively)\b",
             command,
@@ -2877,7 +2647,7 @@ Output only the diff, enclosed in diff ... .
         return "", False
 
     # --------------------------------------------------------------------------
-    # LTM retrieval for smart context selection
+    # LTM retrieval (smart context & memories) – fixed where filters with $and
     # --------------------------------------------------------------------------
     async def _retrieve_historical_messages(
         self, query: str, project_id: str, limit: int
@@ -2886,12 +2656,16 @@ Output only the diff, enclosed in diff ... .
             return []
         try:
             q_emb = self.embedder.encode(query[:1000]).tolist()
+            now = time.time()
+            # Build $and filter for multiple conditions
             where_filter = {
-                "project_id": project_id,
-                "is_hierarchical_summary": {"$ne": True},
+                "$and": [
+                    {"project_id": {"$eq": project_id}},
+                    {"is_hierarchical_summary": {"$ne": True}},
+                ]
             }
             if self.valves.long_term_memory_expiration_days > 0:
-                where_filter["expires_at"] = {"$gt": datetime.utcnow().isoformat()}
+                where_filter["$and"].append({"expires_at": {"$gt": now}})
             results = self.memory_collection.query(
                 query_embeddings=[q_emb],
                 n_results=limit,
@@ -2904,7 +2678,12 @@ Output only the diff, enclosed in diff ... .
                     meta = results["metadatas"][0][i]
                     role = meta.get("role", "user")
                     messages.append({"role": role, "content": doc})
-            summary_filter = {"project_id": project_id, "is_hierarchical_summary": True}
+            summary_filter = {
+                "$and": [
+                    {"project_id": {"$eq": project_id}},
+                    {"is_hierarchical_summary": {"$eq": True}},
+                ]
+            }
             summary_results = self.memory_collection.query(
                 query_embeddings=[q_emb],
                 n_results=limit // 2,
@@ -2940,11 +2719,14 @@ Output only the diff, enclosed in diff ... .
             return []
         try:
             q_emb = self.embedder.encode(query[:1000]).tolist()
-            where_filter = {"project_id": project_id}
+            now = time.time()
+            where_filter = {"$and": [{"project_id": {"$eq": project_id}}]}
             if self.valves.long_term_memory_expiration_days > 0:
-                where_filter["expires_at"] = {"$gt": datetime.utcnow().isoformat()}
+                where_filter["$and"].append({"expires_at": {"$gt": now}})
             if content_type_filter:
-                where_filter["content_type"] = content_type_filter.value
+                where_filter["$and"].append(
+                    {"content_type": {"$eq": content_type_filter.value}}
+                )
             results = self.memory_collection.query(
                 query_embeddings=[q_emb],
                 n_results=(
@@ -2960,11 +2742,9 @@ Output only the diff, enclosed in diff ... .
                 for i, doc in enumerate(results["documents"][0]):
                     sim = 1 - results["distances"][0][i]
                     if self.valves.ltm_time_decay_hours > 0 and results["metadatas"]:
-                        age_str = results["metadatas"][0][i].get("timestamp", "")
-                        if age_str:
-                            age_hours = (
-                                datetime.utcnow() - datetime.fromisoformat(age_str)
-                            ).total_seconds() / 3600
+                        age_str = results["metadatas"][0][i].get("timestamp")
+                        if age_str is not None:
+                            age_hours = (now - age_str) / 3600
                             sim *= 0.5 ** (age_hours / self.valves.ltm_time_decay_hours)
                     if sim >= self.valves.long_term_memory_similarity_threshold:
                         docs_with_scores.append((doc, sim))
@@ -2989,26 +2769,22 @@ Output only the diff, enclosed in diff ... .
             return []
 
     # --------------------------------------------------------------------------
-    # LTM storage
+    # LTM storage (async)
     # --------------------------------------------------------------------------
-    def _store_message_in_memory(self, message: dict, project_id: str):
+    async def _store_message_in_memory(self, message: dict, project_id: str):
         if not HAS_SENTENCE or not HAS_CHROMA or self.memory_collection is None:
             return
         content = message.get("content", "")
         if not content or len(content.strip()) < 15:
             return
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        extracted = loop.run_until_complete(self._extract_code_blocks(content))
-        loop.close()
+        extracted = await self._extract_code_blocks(content)
         content_type = self._classify_content(content, extracted)
         msg_id = f"{project_id}_{int(time.time())}_{hashlib.md5(content.encode()).hexdigest()[:8]}"
         expires_at = None
         if self.valves.long_term_memory_expiration_days > 0:
-            expires_at = (
-                datetime.utcnow()
-                + timedelta(days=self.valves.long_term_memory_expiration_days)
-            ).isoformat()
+            expires_at = time.time() + (
+                self.valves.long_term_memory_expiration_days * 86400
+            )
         embedding = self.embedder.encode(content).tolist()
         self.memory_collection.upsert(
             ids=[msg_id],
@@ -3017,7 +2793,7 @@ Output only the diff, enclosed in diff ... .
                 {
                     "role": message.get("role"),
                     "project_id": project_id,
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": time.time(),
                     "expires_at": expires_at,
                     "content_type": content_type.value,
                     "has_code": len(extracted) > 0,
@@ -3036,7 +2812,9 @@ Output only the diff, enclosed in diff ... .
         if not HAS_AIOHTTP or not self.memory_collection:
             return
         try:
-            results = self.memory_collection.get(where={"project_id": project_id})
+            results = self.memory_collection.get(
+                where={"$and": [{"project_id": {"$eq": project_id}}]}
+            )
             if (
                 not results
                 or len(results["ids"]) < self.valves.ltm_compress_after_messages
@@ -3046,15 +2824,14 @@ Output only the diff, enclosed in diff ... .
             docs = results["documents"]
             metadatas = results["metadatas"]
             pairs = sorted(
-                zip(ids, docs, metadatas), key=lambda x: x[2].get("timestamp", "")
+                zip(ids, docs, metadatas), key=lambda x: x[2].get("timestamp", 0)
             )
             to_compress = pairs[: max(len(pairs) // 3, 5)]
             if len(to_compress) < 2:
                 return
             texts = "\n---\n".join([doc for _, doc, _ in to_compress])
-            prompt = f"Summarise the following conversation segment, keeping key technical decisions and code changes:\n\n{texts[:3000]}"
             summary = await self._call_llm(
-                prompt=prompt,
+                prompt=f"Summarise the following conversation segment, keeping key technical decisions and code changes:\n\n{texts[:3000]}",
                 system_prompt="You produce concise, information-dense summaries.",
                 max_tokens=500,
                 temperature=0.3,
@@ -3070,7 +2847,7 @@ Output only the diff, enclosed in diff ... .
                         {
                             "project_id": project_id,
                             "is_summary": True,
-                            "timestamp": datetime.utcnow().isoformat(),
+                            "timestamp": time.time(),
                         }
                     ],
                     documents=[summary],
@@ -3082,7 +2859,7 @@ Output only the diff, enclosed in diff ... .
             logger.warning(f"LTM compression failed: {e}")
 
     # --------------------------------------------------------------------------
-    # Feedback handling
+    # Feedback
     # --------------------------------------------------------------------------
     async def _parse_feedback_intent(self, user_message: str) -> Optional[Dict]:
         if not self.valves.enable_feedback_tracking:
@@ -3173,7 +2950,7 @@ Output only JSON.
         return "\n".join(lines)
 
     # --------------------------------------------------------------------------
-    # Token estimation for messages
+    # Token estimation
     # --------------------------------------------------------------------------
     def _estimate_tokens(self, messages: List[dict]) -> int:
         if self.tokenizer:
@@ -3188,7 +2965,7 @@ Output only JSON.
         return total_chars // 4
 
     # --------------------------------------------------------------------------
-    # Active code context (excluding obsolete blocks)
+    # Active code context
     # --------------------------------------------------------------------------
     def _get_active_code_context(self, project_id: str) -> str:
         state = self._get_state(project_id)
@@ -3258,9 +3035,9 @@ Output only JSON.
         return "\n".join(parts)
 
     # --------------------------------------------------------------------------
-    # Update active code from message
+    # Update active code (async)
     # --------------------------------------------------------------------------
-    def _update_active_code(self, message: dict, project_id: str):
+    async def _update_active_code(self, message: dict, project_id: str):
         if not self.valves.enable_code_awareness:
             return
         state = self._get_state(project_id)
@@ -3283,11 +3060,7 @@ Output only JSON.
                 block.last_mentioned = time.time()
                 block._update_importance()
 
-        # Extract code blocks (async but run in sync context)
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        extracted = loop.run_until_complete(self._extract_code_blocks(content))
-        loop.close()
+        extracted = await self._extract_code_blocks(content)
         if not content and not extracted:
             return
 
@@ -3418,7 +3191,6 @@ Output only JSON.
                     self._refresh_dependencies_for_block(new_block.hash, project_id)
                 )
 
-        # Assistant learning: update best matching base block
         if role == "assistant" and len(extracted) > 0:
             for block_info in extracted:
                 best_base = None
@@ -3489,52 +3261,198 @@ Output only JSON.
                 return True, ex
         return False, None
 
-    def _remove_duplicate_blocks(self, state: Dict):
-        if not self.valves.auto_remove_duplicate_blocks:
+    async def _update_dependencies(self, block_hash: str, state: Dict):
+        block = state["active_blocks"].get(block_hash)
+        if not block:
             return
-        blocks = list(state["active_blocks"].values())
-        to_remove = set()
-        for i, block in enumerate(blocks):
-            if block.hash in to_remove or block.pinned or block.obsolete:
+        deps = await self._extract_dependencies_hybrid(block.content, block.file_path)
+        if (
+            block.file_path and block.file_path.endswith(".py")
+        ) or "def " in block.content:
+            imports, calls = self._extract_dependencies_ast(block.content)
+            block.ast_imports = imports
+            block.ast_calls = calls
+        block.dependencies = deps
+        self._log_debug(f"Updated dependencies for block {block_hash}: {deps}")
+
+    async def _mark_affected_blocks(self, changed_hash: str, state: Dict):
+        changed_block = state["active_blocks"].get(changed_hash)
+        if not changed_block:
+            return
+        affected_identifiers = set()
+        if changed_block.file_path:
+            base = os.path.splitext(os.path.basename(changed_block.file_path))[0]
+            affected_identifiers.add(base)
+            affected_identifiers.add(changed_block.file_path)
+        sig = self._extract_signature(changed_block.content)
+        if sig:
+            name_match = re.search(r"`([A-Za-z_][A-Za-z0-9_]*)", sig)
+            if name_match:
+                affected_identifiers.add(name_match.group(1))
+        for h, block in state["active_blocks"].items():
+            if h == changed_hash:
                 continue
-            for j, other in enumerate(blocks[i + 1 :], start=i + 1):
-                if other.hash in to_remove or other.pinned or other.obsolete:
-                    continue
-                sim = self._calculate_code_similarity(block.content, other.content)
-                if sim >= self.valves.code_similarity_threshold:
-                    age_diff = abs(block.timestamp - other.timestamp) / 3600
-                    if age_diff > self.valves.max_duplicate_age_hours:
-                        if (
-                            block.timestamp < other.timestamp
-                            and block.importance_score < 5.0
-                        ):
-                            to_remove.add(block.hash)
-                        elif (
-                            other.timestamp < block.timestamp
-                            and other.importance_score < 5.0
-                        ):
-                            to_remove.add(other.hash)
-                        continue
-                    if block.importance_score >= other.importance_score:
-                        to_remove.add(other.hash)
-                    else:
-                        to_remove.add(block.hash)
-        if to_remove:
-            for h in to_remove:
-                if h in state["active_blocks"]:
-                    self._log_debug(
-                        f"Auto-removed duplicate block {h} (importance: {state['active_blocks'][h].importance_score:.1f})"
-                    )
-                    del state["active_blocks"][h]
-            state["recent_changes"] = [
-                b for b in state["recent_changes"] if b.hash not in to_remove
-            ]
-            state["committed_changes"] = [
-                b for b in state["committed_changes"] if b.hash not in to_remove
-            ]
+            block_deps = (
+                block.dependencies
+                + getattr(block, "ast_imports", [])
+                + getattr(block, "ast_calls", [])
+            )
+            if any(dep in affected_identifiers for dep in block_deps):
+                block.potentially_affected = True
+                block.affected_timestamp = time.time()
+                block._update_importance()
+                self._log_debug(
+                    f"Block {h} marked as potentially affected due to dependency on {changed_hash}"
+                )
+
+    async def _refresh_dependencies_for_block(self, block_hash: str, project_id: str):
+        if not self.valves.enable_dependency_tracking:
+            return
+        state = self._get_state(project_id)
+        if not state or block_hash not in state["active_blocks"]:
+            return
+        await self._update_dependencies(block_hash, state)
+        await self._mark_affected_blocks(block_hash, state)
+        self._set_state(project_id, state)
+
+    async def _clean_affected_flags(self, project_id: str):
+        if not self.valves.enable_dependency_tracking:
+            return
+        state = self._get_state(project_id)
+        if not state:
+            return
+        now = time.time()
+        decay = self.valves.affected_decay_hours * 3600
+        if decay <= 0:
+            return
+        changed = False
+        for block in state["active_blocks"].values():
+            if block.potentially_affected and (now - block.affected_timestamp) > decay:
+                block.potentially_affected = False
+                block._update_importance()
+                changed = True
+                self._log_debug(f"Cleared affected flag for block {block.hash}")
+        if changed:
+            self._set_state(project_id, state)
 
     # --------------------------------------------------------------------------
-    # Inlet (main entry point)
+    # Reranking
+    # --------------------------------------------------------------------------
+    def _load_reranker(self):
+        if not self.valves.enable_reranking or not HAS_CROSS_ENCODER:
+            return
+        if self._cross_encoder is None:
+            try:
+                self._cross_encoder = CrossEncoder(self.valves.reranker_model)
+                self._log_debug(f"Loaded reranker model {self.valves.reranker_model}")
+            except Exception as e:
+                logger.warning(f"Failed to load reranker model: {e}")
+                self.valves.enable_reranking = False
+
+    async def _rerank_results(
+        self, query: str, documents: List[str], top_k: int
+    ) -> List[str]:
+        if not self.valves.enable_reranking or not self._cross_encoder or not documents:
+            return documents[:top_k]
+        pairs = [(query, doc) for doc in documents]
+        scores = self._cross_encoder.predict(pairs)
+        scored = list(zip(documents, scores))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [doc for doc, _ in scored[:top_k]]
+
+    # --------------------------------------------------------------------------
+    # Code extraction and classification
+    # --------------------------------------------------------------------------
+    async def _extract_code_blocks(self, content: str) -> List[Dict[str, Any]]:
+        blocks = []
+        if not self.valves.auto_detect_code_blocks:
+            return blocks
+        for match in self.code_pattern.finditer(content):
+            lang = match.group(1) or "text"
+            code = match.group(2).strip()
+            code = await self._handle_oversized_code_block(code, lang)
+            blocks.append({"language": lang, "code": code, "type": "fenced"})
+        lines = content.split("\n")
+        indented = []
+        for line in lines:
+            if line.startswith(("    ", "\t")):
+                indented.append(line.lstrip(" \t"))
+            else:
+                if len(indented) >= 3:
+                    code = "\n".join(indented)
+                    code = await self._handle_oversized_code_block(code, "text")
+                    blocks.append(
+                        {"language": "text", "code": code, "type": "indented"}
+                    )
+                indented = []
+        if len(indented) >= 3:
+            code = "\n".join(indented)
+            code = await self._handle_oversized_code_block(code, "text")
+            blocks.append({"language": "text", "code": code, "type": "indented"})
+        return blocks
+
+    def _extract_line_range(
+        self, content: str
+    ) -> Tuple[Optional[str], Optional[int], Optional[int]]:
+        if not self.valves.track_line_numbers:
+            return None, None, None
+        pattern = r"(?:^|\s)([a-zA-Z0-9_\-\./]+\.\w+):(\d+)(?:-(\d+))?"
+        match = re.search(pattern, content)
+        if match:
+            file_path = match.group(1)
+            line_start = int(match.group(2))
+            line_end = int(match.group(3)) if match.group(3) else line_start
+            return file_path, line_start, line_end
+        return None, None, None
+
+    def _extract_file_paths(self, content: str) -> List[str]:
+        if not self.valves.track_file_paths:
+            return []
+        return re.findall(self.valves.file_path_pattern, content)
+
+    def _classify_content(
+        self, content: str, extracted_blocks: List[Dict]
+    ) -> ContentType:
+        cl = content.lower()
+        if self.valves.enable_feedback_tracking:
+            if re.search(r"\b(worked|yes|correct|resolved|fixed)\b", cl) and re.search(
+                r"\b(change|solution|fix|diff)\b", cl
+            ):
+                return ContentType.GENERAL
+            if re.search(r"\b(did not work|failed|error|still broken|incorrect)\b", cl):
+                return ContentType.GENERAL
+            if content.startswith("/feedback"):
+                return ContentType.GENERAL
+        if self.diff_pattern.search(content) or "diff --git" in content:
+            return ContentType.PROPOSED_CHANGE
+        if self.commit_pattern.search(content):
+            if "applied" in cl or "committed" in cl or "merged" in cl:
+                return ContentType.COMMITTED_CHANGE
+            return ContentType.PROPOSED_CHANGE
+        if "error" in cl or "exception" in cl or "traceback" in cl:
+            return ContentType.ERROR
+        if '"tool_calls"' in content or '"function"' in content:
+            return ContentType.TOOL_CALL
+        for blk in extracted_blocks:
+            if blk["language"] in [
+                "python",
+                "javascript",
+                "typescript",
+                "go",
+                "rust",
+                "java",
+                "cpp",
+            ]:
+                if (
+                    "def " in blk["code"]
+                    or "class " in blk["code"]
+                    or "function " in blk["code"]
+                ):
+                    return ContentType.BASE_CODE
+        return ContentType.GENERAL
+
+    # --------------------------------------------------------------------------
+    # Inlet
     # --------------------------------------------------------------------------
     async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         self._log_debug("inlet called")
@@ -3546,7 +3464,7 @@ Output only JSON.
 
         state = self._get_state(project_id)
 
-        # 1. Forget commands
+        # 1. Forget
         if (
             self.valves.enable_forget_command
             or self.valves.enable_natural_language_forget
@@ -3558,7 +3476,7 @@ Output only JSON.
                 body["messages"] = new_messages
                 return body
 
-        # 2. Remember commands (pin)
+        # 2. Remember
         if self.valves.enable_natural_language_forget:
             last_user_msg = (
                 messages[-1]
@@ -3577,13 +3495,12 @@ Output only JSON.
                     confirmation = await self._execute_remember_intent(
                         project_id, remember_intent
                     )
-                    new_messages = messages + [
+                    body["messages"] = messages + [
                         {"role": "assistant", "content": confirmation}
                     ]
-                    body["messages"] = new_messages
                     return body
 
-        # 3. Obsolete marking
+        # 3. Obsolete
         if self.valves.enable_obsolete_marking:
             last_user_msg = (
                 messages[-1]
@@ -3608,7 +3525,7 @@ Output only JSON.
                     body["messages"] = messages
                     return body
 
-        # 4. Chain-of-Thought (/think)
+        # 4. /think
         if self.valves.enable_cot_on_demand:
             last_user_msg = (
                 messages[-1]
@@ -3634,7 +3551,7 @@ Output only JSON.
                     body["messages"] = messages
                     return body
 
-        # 5. Assumption extraction (/assume)
+        # 5. /assume
         if self.valves.enable_assumption_extraction:
             last_user_msg = (
                 messages[-1]
@@ -3657,7 +3574,7 @@ Output only JSON.
                     body["messages"] = messages
                     return body
 
-        # 6. Iterative execution (/iterate)
+        # 6. /iterate
         if self.valves.enable_iterative_mode:
             last_user_msg = (
                 messages[-1]
@@ -3674,7 +3591,7 @@ Output only JSON.
                     body["messages"] = messages
                     return body
 
-        # 7. Smart context selection
+        # 7. Smart context
         if self.valves.smart_context_selection and len(messages) > 0:
             last_user_idx = -1
             for i in range(len(messages) - 1, -1, -1):
@@ -3684,9 +3601,8 @@ Output only JSON.
             if last_user_idx != -1:
                 query = messages[last_user_idx].get("content", "")
                 if query:
-                    top_k = self.valves.smart_context_top_k
                     historical = await self._retrieve_historical_messages(
-                        query, project_id, top_k
+                        query, project_id, self.valves.smart_context_top_k
                     )
                     new_history = []
                     if self.valves.smart_context_include_last_user:
@@ -3717,12 +3633,12 @@ Output only JSON.
                 body["messages"] = messages
                 self._log_debug("Contradiction warning injected")
 
-        # 9. Update active code from recent messages
+        # 9. Update active code (async)
         if self.valves.enable_code_awareness:
             for msg in messages[-5:]:
-                self._update_active_code(msg, project_id)
+                await self._update_active_code(msg, project_id)
 
-        # 10. LTM retrieval (if smart context not used)
+        # 10. LTM retrieval
         if not self.valves.smart_context_selection:
             last_user_msg = next(
                 (m for m in reversed(messages) if m.get("role") == "user"), None
@@ -3757,7 +3673,7 @@ Output only JSON.
                         messages.insert(0, {"role": "system", "content": ctx})
                     body["messages"] = messages
 
-        # 11. Response cache (check before LLM call)
+        # 11. Response cache
         if self.valves.enable_response_cache and HAS_SENTENCE:
             last_user_msg = next(
                 (m for m in reversed(messages) if m.get("role") == "user"), None
@@ -3796,7 +3712,7 @@ Output only JSON.
                     messages.insert(0, {"role": "system", "content": facts_ctx})
                 body["messages"] = messages
 
-        # 14. Inject confidence scoring instruction
+        # 14. Confidence scoring
         if self.valves.enable_confidence_scoring:
             sys_msgs = [m for m in messages if m.get("role") == "system"]
             if sys_msgs:
@@ -3807,7 +3723,7 @@ Output only JSON.
                 )
             body["messages"] = messages
 
-        # 15. Inject feedback context
+        # 15. Feedback context
         if self.valves.enable_feedback_tracking and self.valves.inject_feedback_context:
             feedback_ctx = self._get_feedback_context(project_id)
             if feedback_ctx:
@@ -3820,14 +3736,13 @@ Output only JSON.
                     messages.insert(0, {"role": "system", "content": feedback_ctx})
                 body["messages"] = messages
 
-        # 16. Proactive suggestions (context usage & commands)
+        # 16. Proactive suggestions
         system_msgs = [m for m in messages if m.get("role") == "system"]
         history_msgs = [m for m in messages if m.get("role") != "system"]
         total_tokens = self._estimate_tokens(system_msgs + history_msgs)
-        max_tokens = self.valves.context_window_tokens
-        if max_tokens > 0:
+        if self.valves.context_window_tokens > 0:
             suggestion = await self._check_and_suggest_summarization(
-                project_id, total_tokens, max_tokens
+                project_id, total_tokens, self.valves.context_window_tokens
             )
             if suggestion:
                 messages.insert(0, {"role": "system", "content": suggestion})
@@ -3838,7 +3753,7 @@ Output only JSON.
             messages.insert(0, {"role": "system", "content": cmd_suggestion})
             body["messages"] = messages
 
-        # 17. Duplicate question detection
+        # 17. Duplicate question
         if self.valves.duplicate_question_threshold and HAS_SENTENCE:
             last_user_msg = next(
                 (m for m in reversed(messages) if m.get("role") == "user"), None
@@ -3852,7 +3767,7 @@ Output only JSON.
                     messages.insert(0, {"role": "system", "content": warn_msg})
                     body["messages"] = messages
 
-        # 18. Adaptive trim (fallback)
+        # 18. Adaptive trim
         system_msgs = [m for m in messages if m.get("role") == "system"]
         history_msgs = [m for m in messages if m.get("role") != "system"]
         trim_needed = False
@@ -3924,9 +3839,8 @@ Output only JSON.
         state = self._get_state(project_id)
         for msg in messages:
             if msg.get("role") in ("user", "assistant"):
-                self._update_active_code(msg, project_id)
-                self._store_message_in_memory(msg, project_id)
-        # Store response in cache after generation (for the last user query)
+                await self._update_active_code(msg, project_id)
+                await self._store_message_in_memory(msg, project_id)
         if self.valves.enable_response_cache and HAS_SENTENCE and len(messages) >= 2:
             last_user = next(
                 (m for m in reversed(messages) if m.get("role") == "user"), None
@@ -3935,9 +3849,7 @@ Output only JSON.
                 (m for m in reversed(messages) if m.get("role") == "assistant"), None
             )
             if last_user and last_assistant:
-                context_hash = self._compute_context_hash(
-                    messages[:-1]
-                )  # exclude last assistant from context
+                context_hash = self._compute_context_hash(messages[:-1])
                 await self._store_response_in_cache(
                     last_user.get("content", ""),
                     last_assistant.get("content", ""),
