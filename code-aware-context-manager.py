@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants. Persists state
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.23.4
+version: 5.23.5
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz
 """
@@ -192,6 +192,10 @@ class Filter:
             default="\n\nAfter your response, on a new line, output '[Confidence: XX%]' where XX is your estimated confidence (0-100) in the correctness and completeness of your answer, based on the available context. If you lack information, give lower confidence and suggest what context would help."
         )
         enable_cot_on_demand: bool = Field(default=True)
+        enable_code_review_mode: bool = Field(
+            default=True,
+            description="Injects a rigorous code-review checklist when the user asks for code review.",
+        )
         cot_model: str = Field(
             default="ollama/yanjia/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-APEX-I-Balanced:latest"
         )
@@ -2159,6 +2163,33 @@ Output only JSON.
             return True
         return False
 
+    def _is_code_review_request(self, user_message: str) -> bool:
+        """Return True if the user is asking for a code review or bug fix."""
+        if not user_message:
+            return False
+        content = user_message.strip().lower()
+        review_keywords = [
+            "revisa",
+            "revisar",
+            "review",
+            "check",
+            "bug",
+            "error",
+            "fix",
+            "arregla",
+            "corrige",
+            "mejora",
+            "improve",
+            "refactor",
+            "refactoriza",
+            "optimize",
+            "optimiza",
+            "qué errores tiene",
+            "what errors",
+            "code review",
+        ]
+        return any(kw in content for kw in review_keywords)
+
     async def _classify_session(self, messages: List[dict], project_id: str) -> bool:
         state = self._get_state(project_id)
         if state and state.get("active_blocks"):
@@ -3653,10 +3684,20 @@ Output only JSON.
                     body["messages"] = messages
                     return body
 
-        # 12. Inject active code context
+        # 12. Inject active code context (with lightweight code quality checklist)
         if is_code_session:
             active_ctx = self._get_active_code_context(project_id)
             if active_ctx:
+                # Add a lightweight code review checklist to every code session
+                checklist = (
+                    "## Before outputting code, mentally verify:\n"
+                    "- Both sides of boolean conditions.\n"
+                    "- Regex patterns against empty string and special chars.\n"
+                    "- List/collection operations with empty input.\n"
+                    "- Maximum possible size of loops/recursion.\n"
+                    "- Off-by-one errors in array indices.\n"
+                )
+                active_ctx = checklist + "\n\n" + active_ctx
                 sys_msgs = [m for m in messages if m.get("role") == "system"]
                 if sys_msgs:
                     sys_msgs[0]["content"] = (
@@ -3665,6 +3706,39 @@ Output only JSON.
                 else:
                     messages.insert(0, {"role": "system", "content": active_ctx})
                 body["messages"] = messages
+
+        # 12b. Inject code review checklist if the user is asking for a review
+        if (
+            is_code_session
+            and self.valves.enable_code_review_mode
+            and self._is_code_review_request(
+                next(
+                    (
+                        m.get("content", "")
+                        for m in reversed(messages)
+                        if m.get("role") == "user"
+                    ),
+                    "",
+                )
+            )
+        ):
+            self._log_debug("12b. Injecting code review checklist")
+            review_prompt = (
+                "## Code Review Checklist\n"
+                "You are reviewing code. Follow these steps:\n"
+                "1. Execute the code mentally with 3 different inputs, including edge cases.\n"
+                "2. Identify every assumption the code makes and verify each one.\n"
+                "3. For every regex or string match, test it against 5 counter-examples.\n"
+                "4. If the code processes a list/collection, test with empty, single-element, and large inputs.\n"
+                "5. Ask yourself: what is the worst-case scenario for this code?\n"
+                "6. Output your reasoning step by step, then provide the corrected code.\n"
+            )
+            sys_msgs = [m for m in messages if m.get("role") == "system"]
+            if sys_msgs:
+                sys_msgs[0]["content"] = review_prompt + "\n" + sys_msgs[0]["content"]
+            else:
+                messages.insert(0, {"role": "system", "content": review_prompt})
+            body["messages"] = messages
 
         # 13. Inject facts
         if (
