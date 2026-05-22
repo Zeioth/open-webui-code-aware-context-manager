@@ -4,7 +4,7 @@ description: Full-featured context manager for coding assistants. Persists state
 author: zeioth
 author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
-version: 5.23.5
+version: 5.23.6
 license: GPL3
 requirements: aiohttp, loguru, orjson, tiktoken, sentence-transformers, chromadb, rapidfuzz
 """
@@ -192,6 +192,14 @@ class Filter:
             default="\n\nAfter your response, on a new line, output '[Confidence: XX%]' where XX is your estimated confidence (0-100) in the correctness and completeness of your answer, based on the available context. If you lack information, give lower confidence and suggest what context would help."
         )
         enable_cot_on_demand: bool = Field(default=True)
+        auto_cot_enabled: bool = Field(
+            default=True,
+            description="Automatically inject chain-of-thought prompt for complex questions.",
+        )
+        auto_cot_min_chars: int = Field(
+            default=200,
+            description="Minimum message length to consider auto-CoT.",
+        )
         enable_code_review_mode: bool = Field(
             default=True,
             description="Injects a rigorous code-review checklist when the user asks for code review.",
@@ -2190,6 +2198,23 @@ Output only JSON.
         ]
         return any(kw in content for kw in review_keywords)
 
+    def _should_auto_cot(self, user_message: str) -> bool:
+        """Return True if the user message looks complex enough for chain-of-thought."""
+        if len(user_message) < self.valves.auto_cot_min_chars:
+            return False
+        # Indicators of complexity: code, logic, errors, multiple steps
+        indicators = [
+            r"\b(if|else|for|while|function|def|class|return)\b",
+            r"\b(error|bug|fix|issue|problem|exception|crash)\b",
+            r"\b(how|why|explain|what|when|where)\b",
+            r"\b(step|implement|create|design|architecture)\b",
+            r"[{};]",  # code-like punctuation
+        ]
+        for pat in indicators:
+            if re.search(pat, user_message, re.IGNORECASE):
+                return True
+        return False
+
     async def _classify_session(self, messages: List[dict], project_id: str) -> bool:
         state = self._get_state(project_id)
         if state and state.get("active_blocks"):
@@ -3508,33 +3533,52 @@ Output only JSON.
                     body["messages"] = self._ensure_last_message_is_user(messages)
                     return body
 
-        # 4. /think
-        if self.valves.enable_cot_on_demand:
+        # 4. /think (explicit) or auto Chain-of-Thought
+        if self.valves.enable_cot_on_demand or self.valves.auto_cot_enabled:
             last_user_msg = (
                 messages[-1]
                 if messages and messages[-1].get("role") == "user"
                 else None
             )
-            if last_user_msg and (
-                is_code_session or last_user_msg.get("content", "").startswith("/")
-            ):
-                cot_question = await self._parse_cot_intent(
-                    last_user_msg.get("content", "")
-                )
-                if cot_question:
-                    active_ctx = self._get_active_code_context(project_id)
-                    facts_ctx = self._get_facts_context(project_id)
-                    context = f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
-                    reasoning = await self._generate_cot(cot_question, context)
-                    messages.pop()
-                    messages.append(
-                        {
-                            "role": "assistant",
-                            "content": f"**Chain-of-Thought Reasoning**\n{reasoning}",
-                        }
-                    )
-                    body["messages"] = self._ensure_last_message_is_user(messages)
-                    return body
+            if last_user_msg:
+                user_content = last_user_msg.get("content", "")
+                # Explicit /think command
+                if self.valves.enable_cot_on_demand and user_content.strip().startswith(
+                    "/think"
+                ):
+                    cot_question = await self._parse_cot_intent(user_content)
+                    if cot_question:
+                        active_ctx = self._get_active_code_context(project_id)
+                        facts_ctx = self._get_facts_context(project_id)
+                        context = f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
+                        reasoning = await self._generate_cot(cot_question, context)
+                        messages.pop()
+                        messages.append(
+                            {
+                                "role": "assistant",
+                                "content": f"**Chain-of-Thought Reasoning**\n{reasoning}",
+                            }
+                        )
+                        body["messages"] = self._ensure_last_message_is_user(messages)
+                        return body
+
+                # Auto-CoT: inject CoT prompt if the message looks complex and not a command
+                elif (
+                    self.valves.auto_cot_enabled
+                    and self._should_auto_cot(user_content)
+                    and not user_content.strip().startswith("/")
+                ):
+                    self._log_debug("4. Auto-injecting Chain-of-Thought prompt")
+                    sys_msgs = [m for m in messages if m.get("role") == "system"]
+                    cot_prompt = "Please think step by step before answering. Show your reasoning, then provide the final answer."
+                    if sys_msgs:
+                        sys_msgs[0]["content"] = (
+                            cot_prompt + "\n" + sys_msgs[0]["content"]
+                        )
+                    else:
+                        messages.insert(0, {"role": "system", "content": cot_prompt})
+                    body["messages"] = messages
+                    # Continue with the rest of the inlet; the model will now use CoT
 
         # 5. /assume
         if self.valves.enable_assumption_extraction:
@@ -3690,12 +3734,13 @@ Output only JSON.
             if active_ctx:
                 # Add a lightweight code review checklist to every code session
                 checklist = (
-                    "## Before outputting code, mentally verify:\n"
-                    "- Both sides of boolean conditions.\n"
-                    "- Regex patterns against empty string and special chars.\n"
-                    "- List/collection operations with empty input.\n"
-                    "- Maximum possible size of loops/recursion.\n"
-                    "- Off-by-one errors in array indices.\n"
+                    "## If you are reviewing, fixing, or improving code, follow this checklist:\n"
+                    "1. Execute the code mentally with 3 different inputs, including edge cases.\n"
+                    "2. Identify every assumption the code makes and verify each one.\n"
+                    "3. For every regex or string match, test it against 5 counter-examples.\n"
+                    "4. If the code processes a list/collection, test with empty, single-element, and large inputs.\n"
+                    "5. Ask yourself: what is the worst-case scenario for this code?\n"
+                    "6. Output your reasoning step by step, then provide the corrected code.\n"
                 )
                 active_ctx = checklist + "\n\n" + active_ctx
                 sys_msgs = [m for m in messages if m.get("role") == "system"]
