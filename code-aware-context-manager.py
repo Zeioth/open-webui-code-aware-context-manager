@@ -159,7 +159,7 @@ class Filter:
         state_db_path: str = Field(default="/app/backend/data/conversation_state.db")
         track_line_numbers: bool = Field(default=True)
         adaptive_trim: bool = Field(default=True)
-        context_window_tokens: int = Field(default=8192)
+        context_window_tokens: int = Field(default=1000000)
         use_tiktoken: bool = Field(default=True)
 
         long_term_memory_dir: str = Field(default="/app/backend/data/long_term_memory")
