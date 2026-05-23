@@ -155,7 +155,10 @@ class Filter:
     class Valves(BaseModel):
         priority: int = Field(default=0)
         max_turns: int = Field(default=20)
-        debug: bool = Field(default=False)
+        debug: bool = Field(
+            default=True,
+            description="Enable detailed logging.",
+        )
         state_db_path: str = Field(default="/app/backend/data/conversation_state.db")
         track_line_numbers: bool = Field(default=True)
         adaptive_trim: bool = Field(default=True)
@@ -3462,317 +3465,260 @@ Output only JSON.
     # --------------------------------------------------------------------------
     # Inlet
     # --------------------------------------------------------------------------
-    async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
-        self._log_debug("inlet called")
-        messages = body.get("messages", [])
-        project_id = self._get_project_id()
-        if not messages:
-            return body
-        state = self._get_state(project_id)
-        is_code_session = await self._classify_session(messages, project_id)
-        self._log_debug(f"Session: {'code' if is_code_session else 'non-code'}")
 
-        # 1. Forget
-        if (
-            self.valves.enable_forget_command
-            or self.valves.enable_natural_language_forget
-        ) and (
-            is_code_session
-            or (messages and messages[-1].get("content", "").startswith("/"))
+
+async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
+    self._log_debug("inlet called")
+    messages = body.get("messages", [])
+    project_id = self._get_project_id()
+    if not messages:
+        return body
+    state = self._get_state(project_id)
+    is_code_session = await self._classify_session(messages, project_id)
+    self._log_debug(f"Session: {'code' if is_code_session else 'non-code'}")
+
+    # 1. Forget
+    if (
+        self.valves.enable_forget_command or self.valves.enable_natural_language_forget
+    ) and (
+        is_code_session
+        or (messages and messages[-1].get("content", "").startswith("/"))
+    ):
+        new_messages, handled = await self._handle_forget_command(
+            messages, project_id, __user__
+        )
+        if handled:
+            # Fix: keep the original user message, add confirmation as system note
+            # The _handle_forget_command already modifies messages in-place; we just ensure the user message stays.
+            # Instead of calling _ensure_last_message_is_user, we keep messages as they are.
+            # Note: inside _handle_forget_command we also need to apply the same logic (we'll patch that separately)
+            # For now, we trust the patched _handle_forget_command will not remove the user message.
+            # If it still does, we need to patch that function as well.
+            body["messages"] = messages  # directly assign, no dummy insertion
+            return body
+
+    # 2. Remember
+    if self.valves.enable_natural_language_forget:
+        last_user_msg = (
+            messages[-1] if messages and messages[-1].get("role") == "user" else None
+        )
+        if last_user_msg and (
+            is_code_session or last_user_msg.get("content", "").startswith("/")
         ):
-            new_messages, handled = await self._handle_forget_command(
-                messages, project_id, __user__
+            remember_intent = await self._parse_remember_intent(
+                last_user_msg.get("content", "")
             )
-            if handled:
-                new_messages = self._ensure_last_message_is_user(new_messages)
-                body["messages"] = new_messages
+            if (
+                remember_intent
+                and remember_intent.get("action")
+                and remember_intent["action"] != "none"
+            ):
+                confirmation = await self._execute_remember_intent(
+                    project_id, remember_intent
+                )
+                # Fix: add confirmation as a system message, keep user message intact
+                messages.append({"role": "system", "content": confirmation})
+                body["messages"] = messages
                 return body
 
-        # 2. Remember
-        if self.valves.enable_natural_language_forget:
-            last_user_msg = (
-                messages[-1]
-                if messages and messages[-1].get("role") == "user"
-                else None
-            )
-            if last_user_msg and (
-                is_code_session or last_user_msg.get("content", "").startswith("/")
+    # 3. Obsolete
+    if self.valves.enable_obsolete_marking:
+        last_user_msg = (
+            messages[-1] if messages and messages[-1].get("role") == "user" else None
+        )
+        if last_user_msg and (
+            is_code_session or last_user_msg.get("content", "").startswith("/")
+        ):
+            intent = await self._parse_obsolete_intent(last_user_msg["content"])
+            if intent and intent.get("action") != "none":
+                confirmation = await self._execute_obsolete_intent(project_id, intent)
+                # Fix: add confirmation as a system message, do NOT pop the user message
+                messages.append({"role": "system", "content": confirmation})
+                body["messages"] = messages
+                return body
+
+    # 4. /think (explicit) or auto Chain-of-Thought
+    if self.valves.enable_cot_on_demand or self.valves.auto_cot_enabled:
+        last_user_msg = (
+            messages[-1] if messages and messages[-1].get("role") == "user" else None
+        )
+        if last_user_msg:
+            user_content = last_user_msg.get("content", "")
+            # Explicit /think command
+            if self.valves.enable_cot_on_demand and user_content.strip().startswith(
+                "/think"
             ):
-                remember_intent = await self._parse_remember_intent(
-                    last_user_msg.get("content", "")
-                )
-                if (
-                    remember_intent
-                    and remember_intent.get("action")
-                    and remember_intent["action"] != "none"
-                ):
-                    confirmation = await self._execute_remember_intent(
-                        project_id, remember_intent
-                    )
-                    new_messages = self._ensure_last_message_is_user(
-                        messages + [{"role": "assistant", "content": confirmation}]
-                    )
-                    body["messages"] = new_messages
-                    return body
-
-        # 3. Obsolete
-        if self.valves.enable_obsolete_marking:
-            last_user_msg = (
-                messages[-1]
-                if messages and messages[-1].get("role") == "user"
-                else None
-            )
-            if last_user_msg and (
-                is_code_session or last_user_msg.get("content", "").startswith("/")
-            ):
-                intent = await self._parse_obsolete_intent(last_user_msg["content"])
-                if intent and intent.get("action") != "none":
-                    confirmation = await self._execute_obsolete_intent(
-                        project_id, intent
-                    )
-                    messages.pop()
-                    messages.append({"role": "assistant", "content": confirmation})
-                    body["messages"] = self._ensure_last_message_is_user(messages)
-                    return body
-
-        # 4. /think (explicit) or auto Chain-of-Thought
-        if self.valves.enable_cot_on_demand or self.valves.auto_cot_enabled:
-            last_user_msg = (
-                messages[-1]
-                if messages and messages[-1].get("role") == "user"
-                else None
-            )
-            if last_user_msg:
-                user_content = last_user_msg.get("content", "")
-                # Explicit /think command
-                if self.valves.enable_cot_on_demand and user_content.strip().startswith(
-                    "/think"
-                ):
-                    cot_question = await self._parse_cot_intent(user_content)
-                    if cot_question:
-                        active_ctx = self._get_active_code_context(project_id)
-                        facts_ctx = self._get_facts_context(project_id)
-                        context = f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
-                        reasoning = await self._generate_cot(cot_question, context)
-                        messages.pop()
-                        messages.append(
-                            {
-                                "role": "assistant",
-                                "content": f"**Chain-of-Thought Reasoning**\n{reasoning}",
-                            }
-                        )
-                        body["messages"] = self._ensure_last_message_is_user(messages)
-                        return body
-
-                # Auto-CoT: inject CoT prompt if the message looks complex and not a command
-                elif (
-                    self.valves.auto_cot_enabled
-                    and self._should_auto_cot(user_content)
-                    and not user_content.strip().startswith("/")
-                ):
-                    self._log_debug("4. Auto-injecting Chain-of-Thought prompt")
-                    sys_msgs = [m for m in messages if m.get("role") == "system"]
-                    cot_prompt = "Please think step by step before answering. Show your reasoning, then provide the final answer."
-                    if sys_msgs:
-                        sys_msgs[0]["content"] = (
-                            cot_prompt + "\n" + sys_msgs[0]["content"]
-                        )
-                    else:
-                        messages.insert(0, {"role": "system", "content": cot_prompt})
-                    body["messages"] = messages
-                    # Continue with the rest of the inlet; the model will now use CoT
-
-        # 5. /assume
-        if self.valves.enable_assumption_extraction:
-            last_user_msg = (
-                messages[-1]
-                if messages and messages[-1].get("role") == "user"
-                else None
-            )
-            if last_user_msg and (
-                is_code_session or last_user_msg.get("content", "").startswith("/")
-            ):
-                assumption_target = await self._parse_assumption_intent(
-                    last_user_msg.get("content", "")
-                )
-                if assumption_target:
-                    analysis = await self._extract_assumptions(assumption_target)
+                cot_question = await self._parse_cot_intent(user_content)
+                if cot_question:
+                    active_ctx = self._get_active_code_context(project_id)
+                    facts_ctx = self._get_facts_context(project_id)
+                    context = f"Active code:\n{active_ctx}\n\nFacts:\n{facts_ctx}"
+                    reasoning = await self._generate_cot(cot_question, context)
                     messages.pop()
                     messages.append(
                         {
                             "role": "assistant",
-                            "content": f"**Assumption Analysis**\n{analysis}",
+                            "content": f"**Chain-of-Thought Reasoning**\n{reasoning}",
                         }
                     )
                     body["messages"] = self._ensure_last_message_is_user(messages)
                     return body
 
-        # 6. /iterate
-        if self.valves.enable_iterative_mode:
-            last_user_msg = (
-                messages[-1]
-                if messages and messages[-1].get("role") == "user"
-                else None
-            )
-            if last_user_msg and (
-                is_code_session or last_user_msg.get("content", "").startswith("/")
+            # Auto-CoT: inject CoT prompt if the message looks complex and not a command
+            elif (
+                self.valves.auto_cot_enabled
+                and self._should_auto_cot(user_content)
+                and not user_content.strip().startswith("/")
             ):
-                result, consumed = await self._run_iteration(
-                    project_id, last_user_msg.get("content", "")
-                )
-                if consumed:
-                    messages.pop()
-                    messages.append({"role": "assistant", "content": result})
-                    body["messages"] = self._ensure_last_message_is_user(messages)
-                    return body
-
-        # 7. Smart context selection
-        if (
-            self.valves.smart_context_selection
-            and len(messages) > 0
-            and is_code_session
-        ):
-            last_user_idx = -1
-            for i in range(len(messages) - 1, -1, -1):
-                if messages[i].get("role") == "user":
-                    last_user_idx = i
-                    break
-            if last_user_idx != -1:
-                query = messages[last_user_idx].get("content", "")
-                if query:
-                    historical = await self._retrieve_historical_messages(
-                        query, project_id, self.valves.smart_context_top_k
-                    )
-                    # Build list ending with the last user message
-                    new_history = []
-                    # First, older historical messages (mixed roles)
-                    for msg in historical:
-                        if msg["content"] != query:
-                            new_history.append(msg)
-                    # Then the last user message (guaranteed to be last)
-                    new_history.append(messages[last_user_idx])
-                    # Optionally include the assistant reply that follows it
-                    if (
-                        self.valves.smart_context_include_last_user
-                        and last_user_idx + 1 < len(messages)
-                        and messages[last_user_idx + 1].get("role") == "assistant"
-                    ):
-                        new_history.append(messages[last_user_idx + 1])
-                    system_msgs = [m for m in messages if m.get("role") == "system"]
-                    messages = system_msgs + new_history
-                    body["messages"] = messages
-
-        # 8. Contradiction detection
-        if (
-            self.valves.enable_contradiction_detection
-            and self.valves.contradiction_inject_warning
-            and is_code_session
-        ):
-            contradiction_warning = await self._detect_contradictions(messages)
-            if contradiction_warning:
-                messages.insert(0, {"role": "system", "content": contradiction_warning})
+                self._log_debug("4. Auto-injecting Chain-of-Thought prompt")
+                sys_msgs = [m for m in messages if m.get("role") == "system"]
+                cot_prompt = "Please think step by step before answering. Show your reasoning, then provide the final answer."
+                if sys_msgs:
+                    sys_msgs[0]["content"] = cot_prompt + "\n" + sys_msgs[0]["content"]
+                else:
+                    messages.insert(0, {"role": "system", "content": cot_prompt})
                 body["messages"] = messages
 
-        # 9. Update active code
-        if self.valves.enable_code_awareness and is_code_session:
-            for msg in messages[-5:]:
-                await self._update_active_code(msg, project_id)
-
-        # 10. LTM retrieval
-        if not self.valves.smart_context_selection and is_code_session:
-            last_user_msg = next(
-                (m for m in reversed(messages) if m.get("role") == "user"), None
+    # 5. /assume
+    if self.valves.enable_assumption_extraction:
+        last_user_msg = (
+            messages[-1] if messages and messages[-1].get("role") == "user" else None
+        )
+        if last_user_msg and (
+            is_code_session or last_user_msg.get("content", "").startswith("/")
+        ):
+            assumption_target = await self._parse_assumption_intent(
+                last_user_msg.get("content", "")
             )
-            if (
-                last_user_msg
-                and HAS_SENTENCE
-                and HAS_CHROMA
-                and self.valves.enable_code_awareness
-            ):
-                query = last_user_msg.get("content", "")
-                base_mem = await self._retrieve_relevant_memories(
-                    query, project_id, ContentType.BASE_CODE
+            if assumption_target:
+                analysis = await self._extract_assumptions(assumption_target)
+                messages.pop()
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": f"**Assumption Analysis**\n{analysis}",
+                    }
                 )
-                error_mem = (
-                    await self._retrieve_relevant_memories(
-                        query, project_id, ContentType.ERROR
-                    )
-                    if self.valves.preserve_error_context
-                    else []
-                )
-                general_mem = await self._retrieve_relevant_memories(
-                    query, project_id, None
-                )
-                all_mem = list(dict.fromkeys(base_mem + error_mem + general_mem))[:5]
-                if all_mem:
-                    ctx = "## Relevant Past Context\n\n" + "\n---\n".join(all_mem)
-                    sys_msgs = [m for m in messages if m.get("role") == "system"]
-                    if sys_msgs:
-                        sys_msgs[0]["content"] = ctx + "\n\n" + sys_msgs[0]["content"]
-                    else:
-                        messages.insert(0, {"role": "system", "content": ctx})
-                    body["messages"] = messages
+                body["messages"] = self._ensure_last_message_is_user(messages)
+                return body
 
-        # 11. Response cache
-        if self.valves.enable_response_cache and HAS_SENTENCE and is_code_session:
-            last_user_msg = next(
-                (m for m in reversed(messages) if m.get("role") == "user"), None
+    # 6. /iterate
+    if self.valves.enable_iterative_mode:
+        last_user_msg = (
+            messages[-1] if messages and messages[-1].get("role") == "user" else None
+        )
+        if last_user_msg and (
+            is_code_session or last_user_msg.get("content", "").startswith("/")
+        ):
+            result, consumed = await self._run_iteration(
+                project_id, last_user_msg.get("content", "")
             )
-            if last_user_msg:
-                context_hash = self._compute_context_hash(messages)
-                cached = await self._find_cached_response(
-                    last_user_msg.get("content", ""), context_hash, state
-                )
-                if cached:
-                    messages.append(
-                        {"role": "assistant", "content": cached["response"]}
-                    )
-                    body["messages"] = messages
-                    return body
+            if consumed:
+                messages.pop()
+                messages.append({"role": "assistant", "content": result})
+                body["messages"] = self._ensure_last_message_is_user(messages)
+                return body
 
-        # 12. Inject active code context (with lightweight code quality checklist)
-        if is_code_session:
-            active_ctx = self._get_active_code_context(project_id)
-            if active_ctx:
-                # Add a lightweight code review checklist to every code session
-                checklist = (
-                    "## If you are reviewing, fixing, or improving code, follow this checklist:\n"
-                    "1. Execute the code mentally with 3 different inputs, including edge cases.\n"
-                    "2. Identify every assumption the code makes and verify each one.\n"
-                    "3. For every regex or string match, test it against 5 counter-examples.\n"
-                    "4. If the code processes a list/collection, test with empty, single-element, and large inputs.\n"
-                    "5. Ask yourself: what is the worst-case scenario for this code?\n"
-                    "6. Output your reasoning step by step, then provide the corrected code.\n"
+    # 7. Smart context selection
+    if self.valves.smart_context_selection and len(messages) > 0 and is_code_session:
+        last_user_idx = -1
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                last_user_idx = i
+                break
+        if last_user_idx != -1:
+            query = messages[last_user_idx].get("content", "")
+            if query:
+                historical = await self._retrieve_historical_messages(
+                    query, project_id, self.valves.smart_context_top_k
                 )
-                active_ctx = checklist + "\n\n" + active_ctx
+                new_history = []
+                for msg in historical:
+                    if msg["content"] != query:
+                        new_history.append(msg)
+                new_history.append(messages[last_user_idx])
+                if (
+                    self.valves.smart_context_include_last_user
+                    and last_user_idx + 1 < len(messages)
+                    and messages[last_user_idx + 1].get("role") == "assistant"
+                ):
+                    new_history.append(messages[last_user_idx + 1])
+                system_msgs = [m for m in messages if m.get("role") == "system"]
+                messages = system_msgs + new_history
+                body["messages"] = messages
+
+    # 8. Contradiction detection
+    if (
+        self.valves.enable_contradiction_detection
+        and self.valves.contradiction_inject_warning
+        and is_code_session
+    ):
+        contradiction_warning = await self._detect_contradictions(messages)
+        if contradiction_warning:
+            messages.insert(0, {"role": "system", "content": contradiction_warning})
+            body["messages"] = messages
+
+    # 9. Update active code
+    if self.valves.enable_code_awareness and is_code_session:
+        for msg in messages[-5:]:
+            await self._update_active_code(msg, project_id)
+
+    # 10. LTM retrieval
+    if not self.valves.smart_context_selection and is_code_session:
+        last_user_msg = next(
+            (m for m in reversed(messages) if m.get("role") == "user"), None
+        )
+        if (
+            last_user_msg
+            and HAS_SENTENCE
+            and HAS_CHROMA
+            and self.valves.enable_code_awareness
+        ):
+            query = last_user_msg.get("content", "")
+            base_mem = await self._retrieve_relevant_memories(
+                query, project_id, ContentType.BASE_CODE
+            )
+            error_mem = (
+                await self._retrieve_relevant_memories(
+                    query, project_id, ContentType.ERROR
+                )
+                if self.valves.preserve_error_context
+                else []
+            )
+            general_mem = await self._retrieve_relevant_memories(
+                query, project_id, None
+            )
+            all_mem = list(dict.fromkeys(base_mem + error_mem + general_mem))[:5]
+            if all_mem:
+                ctx = "## Relevant Past Context\n\n" + "\n---\n".join(all_mem)
                 sys_msgs = [m for m in messages if m.get("role") == "system"]
                 if sys_msgs:
-                    sys_msgs[0]["content"] = (
-                        active_ctx + "\n\n" + sys_msgs[0]["content"]
-                    )
+                    sys_msgs[0]["content"] = ctx + "\n\n" + sys_msgs[0]["content"]
                 else:
-                    messages.insert(0, {"role": "system", "content": active_ctx})
+                    messages.insert(0, {"role": "system", "content": ctx})
                 body["messages"] = messages
 
-        # 12b. Inject code review checklist if the user is asking for a review
-        if (
-            is_code_session
-            and self.valves.enable_code_review_mode
-            and self._is_code_review_request(
-                next(
-                    (
-                        m.get("content", "")
-                        for m in reversed(messages)
-                        if m.get("role") == "user"
-                    ),
-                    "",
-                )
+    # 11. Response cache
+    if self.valves.enable_response_cache and HAS_SENTENCE and is_code_session:
+        last_user_msg = next(
+            (m for m in reversed(messages) if m.get("role") == "user"), None
+        )
+        if last_user_msg:
+            context_hash = self._compute_context_hash(messages)
+            cached = await self._find_cached_response(
+                last_user_msg.get("content", ""), context_hash, state
             )
-        ):
-            self._log_debug("12b. Injecting code review checklist")
-            review_prompt = (
-                "## Code Review Checklist\n"
-                "You are reviewing code. Follow these steps:\n"
+            if cached:
+                messages.append({"role": "assistant", "content": cached["response"]})
+                body["messages"] = messages
+                return body
+
+    # 12. Inject active code context (with lightweight code quality checklist)
+    if is_code_session:
+        active_ctx = self._get_active_code_context(project_id)
+        if active_ctx:
+            checklist = (
+                "## If you are reviewing, fixing, or improving code, follow this checklist:\n"
                 "1. Execute the code mentally with 3 different inputs, including edge cases.\n"
                 "2. Identify every assumption the code makes and verify each one.\n"
                 "3. For every regex or string match, test it against 5 counter-examples.\n"
@@ -3780,177 +3726,206 @@ Output only JSON.
                 "5. Ask yourself: what is the worst-case scenario for this code?\n"
                 "6. Output your reasoning step by step, then provide the corrected code.\n"
             )
+            active_ctx = checklist + "\n\n" + active_ctx
             sys_msgs = [m for m in messages if m.get("role") == "system"]
             if sys_msgs:
-                sys_msgs[0]["content"] = review_prompt + "\n" + sys_msgs[0]["content"]
+                sys_msgs[0]["content"] = active_ctx + "\n\n" + sys_msgs[0]["content"]
             else:
-                messages.insert(0, {"role": "system", "content": review_prompt})
+                messages.insert(0, {"role": "system", "content": active_ctx})
             body["messages"] = messages
 
-        # 13. Inject facts
-        if (
-            is_code_session
-            and self.valves.enable_facts
-            and self.valves.inject_facts_in_context
-        ):
-            facts_ctx = self._get_facts_context(project_id)
-            if facts_ctx:
-                sys_msgs = [m for m in messages if m.get("role") == "system"]
-                if sys_msgs:
-                    sys_msgs[0]["content"] = facts_ctx + "\n\n" + sys_msgs[0]["content"]
-                else:
-                    messages.insert(0, {"role": "system", "content": facts_ctx})
-                body["messages"] = messages
-
-        # 14. Inject confidence scoring instruction (only when context is getting full)
-        if self.valves.enable_confidence_scoring and is_code_session:
-            total_tokens = self._estimate_tokens(messages)
-            if total_tokens > self.valves.context_window_tokens * 0.8:
-                sys_msgs = [m for m in messages if m.get("role") == "system"]
-                if sys_msgs:
-                    sys_msgs[0]["content"] += self.valves.confidence_prompt
-                else:
-                    messages.insert(
-                        0, {"role": "system", "content": self.valves.confidence_prompt}
-                    )
-                body["messages"] = messages
-
-        # 15. Inject feedback context
-        if (
-            is_code_session
-            and self.valves.enable_feedback_tracking
-            and self.valves.inject_feedback_context
-        ):
-            feedback_ctx = self._get_feedback_context(project_id)
-            if feedback_ctx:
-                sys_msgs = [m for m in messages if m.get("role") == "system"]
-                if sys_msgs:
-                    sys_msgs[0]["content"] = (
-                        feedback_ctx + "\n\n" + sys_msgs[0]["content"]
-                    )
-                else:
-                    messages.insert(0, {"role": "system", "content": feedback_ctx})
-                body["messages"] = messages
-
-        # 16. Proactive suggestions
-        system_msgs = [m for m in messages if m.get("role") == "system"]
-        history_msgs = [m for m in messages if m.get("role") != "system"]
-        total_tokens = self._estimate_tokens(system_msgs + history_msgs)
-        if self.valves.context_window_tokens > 0:
-            suggestion = await self._check_and_suggest_summarization(
-                project_id, total_tokens, self.valves.context_window_tokens
+    # 12b. Inject code review checklist if the user is asking for a review
+    if (
+        is_code_session
+        and self.valves.enable_code_review_mode
+        and self._is_code_review_request(
+            next(
+                (
+                    m.get("content", "")
+                    for m in reversed(messages)
+                    if m.get("role") == "user"
+                ),
+                "",
             )
-            if suggestion:
-                messages.insert(0, {"role": "system", "content": suggestion})
-                body["messages"] = messages
-        cmd_suggestion = await self._suggest_commands(project_id, state)
-        if cmd_suggestion:
-            messages.insert(0, {"role": "system", "content": cmd_suggestion})
-            body["messages"] = messages
-
-        # 17. Duplicate question detection
-        if self.valves.duplicate_question_threshold and HAS_SENTENCE:
-            last_user_msg = next(
-                (m for m in reversed(messages) if m.get("role") == "user"), None
-            )
-            if last_user_msg:
-                duplicate = await self._find_duplicate_question(
-                    last_user_msg.get("content", ""), project_id
-                )
-                if duplicate:
-                    warn_msg = f"⚠️ **Note**: This question is very similar to one you asked before (similarity {duplicate['sim']:.2f})."
-                    messages.insert(0, {"role": "system", "content": warn_msg})
-                    body["messages"] = messages
-
-        # 18. Adaptive context trim
-        trim_needed = False
-        if self.valves.adaptive_trim:
-            total_tokens = self._estimate_tokens(system_msgs + history_msgs)
-            if total_tokens > self.valves.context_window_tokens:
-                trim_needed = True
+        )
+    ):
+        self._log_debug("12b. Injecting code review checklist")
+        review_prompt = (
+            "## Code Review Checklist\n"
+            "You are reviewing code. Follow these steps:\n"
+            "1. Execute the code mentally with 3 different inputs, including edge cases.\n"
+            "2. Identify every assumption the code makes and verify each one.\n"
+            "3. For every regex or string match, test it against 5 counter-examples.\n"
+            "4. If the code processes a list/collection, test with empty, single-element, and large inputs.\n"
+            "5. Ask yourself: what is the worst-case scenario for this code?\n"
+            "6. Output your reasoning step by step, then provide the corrected code.\n"
+        )
+        sys_msgs = [m for m in messages if m.get("role") == "system"]
+        if sys_msgs:
+            sys_msgs[0]["content"] = review_prompt + "\n" + sys_msgs[0]["content"]
         else:
-            user_max = (
-                __user__["valves"].get("max_turns")
-                if __user__ and "valves" in __user__
-                else None
-            )
-            eff_max = user_max if user_max is not None else self.valves.max_turns
-            if len(history_msgs) > eff_max:
-                trim_needed = True
+            messages.insert(0, {"role": "system", "content": review_prompt})
+        body["messages"] = messages
 
-        if trim_needed and len(history_msgs) > self.valves.max_turns:
-            self._log_debug("18. Trimming old messages")
-            keep = self.valves.max_turns
-            # Asegurar que el último mensaje sea de usuario
-            last_user_idx = -1
-            for i in range(len(history_msgs) - 1, -1, -1):
-                if history_msgs[i].get("role") == "user":
-                    last_user_idx = i
-                    break
-            if last_user_idx != -1:
-                # Mantener desde el último mensaje de usuario hacia atrás
-                start_idx = max(0, last_user_idx - keep + 1)
-                old_block = history_msgs[:start_idx] if start_idx > 0 else []
-                kept_block = history_msgs[start_idx:]
+    # 13. Inject facts
+    if (
+        is_code_session
+        and self.valves.enable_facts
+        and self.valves.inject_facts_in_context
+    ):
+        facts_ctx = self._get_facts_context(project_id)
+        if facts_ctx:
+            sys_msgs = [m for m in messages if m.get("role") == "system"]
+            if sys_msgs:
+                sys_msgs[0]["content"] = facts_ctx + "\n\n" + sys_msgs[0]["content"]
             else:
-                old_block = history_msgs[:-keep] if keep > 0 else []
-                kept_block = history_msgs[-keep:] if keep > 0 else []
+                messages.insert(0, {"role": "system", "content": facts_ctx})
+            body["messages"] = messages
 
-            if self.valves.summarize_old_messages and old_block:
-                has_code = any("```" in m.get("content", "") for m in old_block)
-                summary = await self._summarize_messages(
-                    old_block, is_code_context=has_code
+    # 14. Inject confidence scoring instruction (only when context is getting full)
+    if self.valves.enable_confidence_scoring and is_code_session:
+        total_tokens = self._estimate_tokens(messages)
+        if total_tokens > self.valves.context_window_tokens * 0.8:
+            sys_msgs = [m for m in messages if m.get("role") == "system"]
+            if sys_msgs:
+                sys_msgs[0]["content"] += self.valves.confidence_prompt
+            else:
+                messages.insert(
+                    0, {"role": "system", "content": self.valves.confidence_prompt}
                 )
-                if summary:
-                    history_msgs = [
-                        {
-                            "role": "assistant",
-                            "content": f"[Summary of earlier conversation]\n{summary}",
-                        }
-                    ] + kept_block
-                else:
-                    history_msgs = kept_block
+            body["messages"] = messages
+
+    # 15. Inject feedback context
+    if (
+        is_code_session
+        and self.valves.enable_feedback_tracking
+        and self.valves.inject_feedback_context
+    ):
+        feedback_ctx = self._get_feedback_context(project_id)
+        if feedback_ctx:
+            sys_msgs = [m for m in messages if m.get("role") == "system"]
+            if sys_msgs:
+                sys_msgs[0]["content"] = feedback_ctx + "\n\n" + sys_msgs[0]["content"]
+            else:
+                messages.insert(0, {"role": "system", "content": feedback_ctx})
+            body["messages"] = messages
+
+    # 16. Proactive suggestions
+    system_msgs = [m for m in messages if m.get("role") == "system"]
+    history_msgs = [m for m in messages if m.get("role") != "system"]
+    total_tokens = self._estimate_tokens(system_msgs + history_msgs)
+    if self.valves.context_window_tokens > 0:
+        suggestion = await self._check_and_suggest_summarization(
+            project_id, total_tokens, self.valves.context_window_tokens
+        )
+        if suggestion:
+            messages.insert(0, {"role": "system", "content": suggestion})
+            body["messages"] = messages
+    cmd_suggestion = await self._suggest_commands(project_id, state)
+    if cmd_suggestion:
+        messages.insert(0, {"role": "system", "content": cmd_suggestion})
+        body["messages"] = messages
+
+    # 17. Duplicate question detection
+    if self.valves.duplicate_question_threshold and HAS_SENTENCE:
+        last_user_msg = next(
+            (m for m in reversed(messages) if m.get("role") == "user"), None
+        )
+        if last_user_msg:
+            duplicate = await self._find_duplicate_question(
+                last_user_msg.get("content", ""), project_id
+            )
+            if duplicate:
+                warn_msg = f"⚠️ **Note**: This question is very similar to one you asked before (similarity {duplicate['sim']:.2f})."
+                messages.insert(0, {"role": "system", "content": warn_msg})
+                body["messages"] = messages
+
+    # 18. Adaptive context trim
+    trim_needed = False
+    if self.valves.adaptive_trim:
+        total_tokens = self._estimate_tokens(system_msgs + history_msgs)
+        if total_tokens > self.valves.context_window_tokens:
+            trim_needed = True
+    else:
+        user_max = (
+            __user__["valves"].max_turns
+            if __user__ and hasattr(__user__, "valves")
+            else None
+        )
+        eff_max = user_max if user_max is not None else self.valves.max_turns
+        if len(history_msgs) > eff_max:
+            trim_needed = True
+
+    if trim_needed and len(history_msgs) > self.valves.max_turns:
+        self._log_debug("18. Trimming old messages")
+        keep = self.valves.max_turns
+        # Ensure the last message is from user
+        last_user_idx = -1
+        for i in range(len(history_msgs) - 1, -1, -1):
+            if history_msgs[i].get("role") == "user":
+                last_user_idx = i
+                break
+        if last_user_idx != -1:
+            start_idx = max(0, last_user_idx - keep + 1)
+            old_block = history_msgs[:start_idx] if start_idx > 0 else []
+            kept_block = history_msgs[start_idx:]
+        else:
+            old_block = history_msgs[:-keep] if keep > 0 else []
+            kept_block = history_msgs[-keep:] if keep > 0 else []
+
+        if self.valves.summarize_old_messages and old_block:
+            has_code = any("```" in m.get("content", "") for m in old_block)
+            summary = await self._summarize_messages(
+                old_block, is_code_context=has_code
+            )
+            if summary:
+                history_msgs = [
+                    {
+                        "role": "assistant",
+                        "content": f"[Summary of earlier conversation]\n{summary}",
+                    }
+                ] + kept_block
             else:
                 history_msgs = kept_block
+        else:
+            history_msgs = kept_block
 
-            if self.valves.preserve_tool_calls:
-                while history_msgs and history_msgs[0].get("role") == "tool":
+        if self.valves.preserve_tool_calls:
+            while history_msgs and history_msgs[0].get("role") == "tool":
+                history_msgs.pop(0)
+            if (
+                history_msgs
+                and history_msgs[0].get("role") == "assistant"
+                and history_msgs[0].get("tool_calls")
+            ):
+                tool_call_ids = {tc.get("id") for tc in history_msgs[0]["tool_calls"]}
+                tool_response_ids = {
+                    m.get("tool_call_id")
+                    for m in history_msgs[1:]
+                    if m.get("role") == "tool"
+                }
+                if not tool_call_ids.issubset(tool_response_ids):
                     history_msgs.pop(0)
-                if (
-                    history_msgs
-                    and history_msgs[0].get("role") == "assistant"
-                    and history_msgs[0].get("tool_calls")
-                ):
-                    tool_call_ids = {
-                        tc.get("id") for tc in history_msgs[0]["tool_calls"]
-                    }
-                    tool_response_ids = {
-                        m.get("tool_call_id")
-                        for m in history_msgs[1:]
-                        if m.get("role") == "tool"
-                    }
-                    if not tool_call_ids.issubset(tool_response_ids):
-                        history_msgs.pop(0)
 
-        # Assemble final messages
-        messages = system_msgs + history_msgs
+    # Assemble final messages
+    messages = system_msgs + history_msgs
 
-        # 19. Final safety: ensure the last message is from user
-        if messages and messages[-1].get("role") != "user":
-            last_user_idx = -1
-            for i in range(len(messages) - 1, -1, -1):
-                if messages[i].get("role") == "user":
-                    last_user_idx = i
-                    break
-            if last_user_idx != -1:
-                messages = messages[: last_user_idx + 1]
-                self._log_debug("Trimmed trailing assistant messages")
-            else:
-                messages.append({"role": "user", "content": "continue"})
-                self._log_debug("Inserted dummy user message to satisfy API")
+    # 19. Final safety: ensure the last message is from user
+    if messages and messages[-1].get("role") != "user":
+        last_user_idx = -1
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                last_user_idx = i
+                break
+        if last_user_idx != -1:
+            messages = messages[: last_user_idx + 1]
+            self._log_debug("Trimmed trailing assistant messages")
+        else:
+            messages.append({"role": "user", "content": "continue"})
+            self._log_debug("Inserted dummy user message to satisfy API")
 
-        body["messages"] = messages
-        return body
+    body["messages"] = messages
+    return body
 
     # --------------------------------------------------------------------------
     # Outlet
