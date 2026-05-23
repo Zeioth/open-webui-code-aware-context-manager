@@ -1,3 +1,5 @@
+REPO → https://github.com/Zeioth/open-webui-code-aware-context-manager
+
 # Code-Aware Context Manager for Open WebUI
 
 A powerful context management filter for Open WebUI that transforms any chat model into a **stateful, code-aware assistant** with:
