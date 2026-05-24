@@ -20,7 +20,7 @@ import json
 import asyncio
 import difflib
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Union
 from enum import Enum
 from pydantic import BaseModel, Field
 
@@ -3768,45 +3768,53 @@ Output only JSON.
                     if m["doc"] not in seen:
                         seen.add(m["doc"])
                         unique_meta.append(m)
-                unique_meta = unique_meta[:5]
 
-                if unique_meta:
-                    parts = []
-                    for mem in unique_meta:
-                        ts = mem.get("timestamp")
-                        if ts and ts > 1000000000:
-                            time_str = datetime.fromtimestamp(
-                                ts, tz=timezone.utc
-                            ).strftime("%Y-%m-%d %H:%M:%SZ")
-                            parts.append(f"[{time_str}] {mem['doc']}")
-                        else:
-                            parts.append(f"[unknown date] {mem['doc']}")
-                    ctx = (
-                        "## Relevant Past Context (with timestamps)\n\n"
-                        + "\n---\n".join(parts)
-                    )
-                    # Truncate if LTM token limit is set
-                    if self.valves.ltm_retrieval_max_tokens > 0:
-                        max_tokens = self.valves.ltm_retrieval_max_tokens
-                        if self.tokenizer:
-                            tokens = self.tokenizer.encode(ctx)
-                            if len(tokens) > max_tokens:
-                                truncated = self.tokenizer.decode(tokens[:max_tokens])
-                                ctx = (
-                                    truncated
-                                    + "\n[LTM context truncated to fit token budget]"
-                                )
-                        else:
-                            if len(ctx) // 4 > max_tokens:
-                                ctx = (
-                                    ctx[: max_tokens * 4] + "\n[LTM context truncated]"
-                                )
-                    sys_msgs = [m for m in messages if m.get("role") == "system"]
-                    if sys_msgs:
-                        sys_msgs[0]["content"] = ctx + "\n\n" + sys_msgs[0]["content"]
-                    else:
-                        messages.insert(0, {"role": "system", "content": ctx})
-                    body["messages"] = messages
+        # ── Token‑budget driven fragment selection ───────────────────────
+        max_ltm_tokens = self.valves.ltm_retrieval_max_tokens
+        parts = []
+        current_tokens = 0
+        header = "## Relevant Past Context (with timestamps)\n\n"
+
+        # Count header tokens if budget is limited
+        if max_ltm_tokens > 0:
+            current_tokens += (
+                len(self.tokenizer.encode(header))
+                if self.tokenizer
+                else (len(header) // 4)
+            )
+
+        for mem in unique_meta:
+            ts = mem.get("timestamp")
+            if ts and ts > 1000000000:
+                time_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
+                    "%Y-%m-%d %H:%M:%SZ"
+                )
+                text = f"[{time_str}] {mem['doc']}"
+            else:
+                text = f"[unknown date] {mem['doc']}"
+
+            # Estimate tokens for this fragment
+            frag_tokens = (
+                len(self.tokenizer.encode(text)) if self.tokenizer else (len(text) // 4)
+            )
+
+            # Stop adding fragments when we would exceed the budget
+            if max_ltm_tokens > 0 and current_tokens + frag_tokens > max_ltm_tokens:
+                continue
+
+            parts.append(text)
+            current_tokens += frag_tokens
+
+        if parts:
+            ctx = header + "\n---\n".join(parts)
+            if max_ltm_tokens > 0 and len(parts) < len(unique_meta):
+                ctx += "\n[Some older fragments omitted to fit token budget]"
+            sys_msgs = [m for m in messages if m.get("role") == "system"]
+            if sys_msgs:
+                sys_msgs[0]["content"] = ctx + "\n\n" + sys_msgs[0]["content"]
+            else:
+                messages.insert(0, {"role": "system", "content": ctx})
+            body["messages"] = messages
 
         # 11. Response cache
         if self.valves.enable_response_cache and HAS_SENTENCE and is_code_session:
