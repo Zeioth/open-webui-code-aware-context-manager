@@ -19,7 +19,7 @@ from collections import OrderedDict, defaultdict
 import json
 import asyncio
 import difflib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple
 from enum import Enum
 from pydantic import BaseModel, Field
@@ -369,6 +369,11 @@ class Filter:
         )
 
         ltm_store_only_code_sessions: bool = Field(default=True)
+        ltm_include_timestamps: bool = Field(
+            default=True,
+            title="LTM Include Timestamps",
+            description="Include the date/time of each retrieved memory fragment in the context.",
+        )
 
     class UserValves(BaseModel):
         max_turns: Optional[int] = Field(default=None)
@@ -3353,9 +3358,10 @@ Output only JSON.
         query: str,
         project_id: str,
         content_type_filter: Optional[ContentType] = None,
-    ) -> List[str]:
+        include_meta: bool = False,
+    ) -> Union[List[str], List[Dict[str, Any]]]:
         if not HAS_SENTENCE or not HAS_CHROMA or self.memory_collection is None:
-            return []
+            return [] if not include_meta else []
         try:
             q_emb = self.embedder.encode(query[:1000]).tolist()
             now = time.time()
@@ -3375,37 +3381,49 @@ Output only JSON.
                 ),
                 where=where_filter,
             )
-            retrieved = []
-            docs_with_scores = []
+            docs_with_meta = []
             if results and results["documents"]:
                 for i, doc in enumerate(results["documents"][0]):
+                    meta = results["metadatas"][0][i]
                     sim = 1 - results["distances"][0][i]
-                    if self.valves.ltm_time_decay_hours > 0 and results["metadatas"]:
-                        age = results["metadatas"][0][i].get("timestamp")
-                        if age is not None:
-                            age_hours = (now - age) / 3600
-                            sim *= 0.5 ** (age_hours / self.valves.ltm_time_decay_hours)
+                    ts = meta.get("timestamp")
+                    if ts is not None and ts < 1000000000:  # invalid timestamp
+                        ts = None
+                    if self.valves.ltm_time_decay_hours > 0 and ts is not None:
+                        age_hours = (now - ts) / 3600
+                        sim *= 0.5 ** (age_hours / self.valves.ltm_time_decay_hours)
                     if sim >= self.valves.long_term_memory_similarity_threshold:
-                        docs_with_scores.append((doc, sim))
-            docs_with_scores.sort(key=lambda x: x[1], reverse=True)
-            retrieved = [doc for doc, _ in docs_with_scores]
-            if self.valves.enable_reranking and self._cross_encoder:
+                        docs_with_meta.append((doc, sim, ts))
+
+            # Sort by similarity score (already decayed)
+            docs_with_meta.sort(key=lambda x: x[1], reverse=True)
+
+            # Apply reranking if enabled
+            if self.valves.enable_reranking and self._cross_encoder and docs_with_meta:
                 rerank_k = (
                     self.valves.reranker_top_k
                     if self.valves.reranker_top_k > 0
                     else self.valves.long_term_memory_top_k
                 )
                 rerank_k = min(rerank_k, 50)
-                if retrieved:
-                    retrieved = await self._rerank_results(
-                        query, retrieved[: rerank_k * 2], rerank_k
-                    )
+                docs_only = [d[0] for d in docs_with_meta[: rerank_k * 2]]
+                reranked = await self._rerank_results(query, docs_only, rerank_k)
+                # Re-map to meta
+                doc_to_meta = {d[0]: (d[1], d[2]) for d in docs_with_meta}
+                docs_with_meta = [
+                    (doc, *doc_to_meta.get(doc, (0.0, None))) for doc in reranked
+                ]
+
+            # Limit to top K
+            docs_with_meta = docs_with_meta[: self.valves.long_term_memory_top_k]
+
+            if include_meta:
+                return [{"doc": doc, "timestamp": ts} for doc, _, ts in docs_with_meta]
             else:
-                retrieved = retrieved[: self.valves.long_term_memory_top_k]
-            return retrieved
+                return [doc for doc, _, _ in docs_with_meta]
         except Exception as e:
             logger.warning(f"Memory retrieval failed: {e}")
-            return []
+            return [] if not include_meta else []
 
     # --------------------------------------------------------------------------
     # Reranking
@@ -3727,21 +3745,46 @@ Output only JSON.
             ):
                 query = last_user_msg.get("content", "")
                 base_mem = await self._retrieve_relevant_memories(
-                    query, project_id, ContentType.BASE_CODE
+                    query, project_id, ContentType.BASE_CODE, include_meta=True
                 )
                 error_mem = (
                     await self._retrieve_relevant_memories(
-                        query, project_id, ContentType.ERROR
+                        query, project_id, ContentType.ERROR, include_meta=True
                     )
                     if self.valves.preserve_error_context
                     else []
                 )
                 general_mem = await self._retrieve_relevant_memories(
-                    query, project_id, None
+                    query, project_id, None, include_meta=True
                 )
-                all_mem = list(dict.fromkeys(base_mem + error_mem + general_mem))[:5]
-                if all_mem:
-                    ctx = "## Relevant Past Context\n\n" + "\n---\n".join(all_mem)
+
+                # Combine, deduplicate by content (keep most recent timestamp)
+                all_meta = base_mem + error_mem + general_mem
+                # Sort by timestamp descending, then deduplicate
+                all_meta.sort(key=lambda x: x.get("timestamp") or 0, reverse=True)
+                seen = set()
+                unique_meta = []
+                for m in all_meta:
+                    if m["doc"] not in seen:
+                        seen.add(m["doc"])
+                        unique_meta.append(m)
+                unique_meta = unique_meta[:5]
+
+                if unique_meta:
+                    parts = []
+                    for mem in unique_meta:
+                        ts = mem.get("timestamp")
+                        if ts and ts > 1000000000:
+                            time_str = datetime.fromtimestamp(
+                                ts, tz=timezone.utc
+                            ).strftime("%Y-%m-%d %H:%M:%SZ")
+                            parts.append(f"[{time_str}] {mem['doc']}")
+                        else:
+                            parts.append(f"[unknown date] {mem['doc']}")
+                    ctx = (
+                        "## Relevant Past Context (with timestamps)\n\n"
+                        + "\n---\n".join(parts)
+                    )
                     # Truncate if LTM token limit is set
                     if self.valves.ltm_retrieval_max_tokens > 0:
                         max_tokens = self.valves.ltm_retrieval_max_tokens
